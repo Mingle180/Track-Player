@@ -21,6 +21,7 @@ except ImportError:
 
 import trackprep
 import trackplayer as tp
+import trackplayer_config as config
 
 MAX_LOG_LINES = 2000
 IDLE, PLAYING = 'idle', 'playing'
@@ -73,24 +74,33 @@ class App:
         # --- params ---
         par = ttk.LabelFrame(main, text='参数')
         par.pack(fill='x', **pad)
+        cfg = config.load_config()
+        preset_row = ttk.Frame(par)
+        preset_row.pack(fill='x', padx=6, pady=(6, 0))
+        ttk.Label(preset_row, text='速度预设').pack(side='left')
+        self.preset_combo = ttk.Combobox(preset_row, state='readonly', width=22)
+        self.preset_combo.pack(side='left', padx=8)
+        self.preset_combo.bind('<<ComboboxSelected>>', self.on_preset)
+        ttk.Label(preset_row, text='选预设自动填入定速，可再微调', foreground='#666').pack(side='left')
+        self._load_presets(cfg)
         grid = ttk.Frame(par)
         grid.pack(fill='x', padx=6, pady=6)
         self.mode_var = tk.StringVar(value='speed')
         ttk.Radiobutton(grid, text='定速 (m/s)', variable=self.mode_var, value='speed',
                         command=self.on_mode).grid(row=0, column=0, sticky='w')
-        self.speed_var = tk.StringVar(value='3')
+        self.speed_var = tk.StringVar(value=f"{cfg.get('default_speed_mps', 3.0):g}")
         self.speed_spin = ttk.Spinbox(grid, from_=0.5, to=20, increment=0.5, width=8,
                                       textvariable=self.speed_var, command=self.refresh_summary)
         self.speed_spin.grid(row=0, column=1, sticky='w', padx=4)
         ttk.Radiobutton(grid, text='倍速 (×)', variable=self.mode_var, value='scale',
                         command=self.on_mode).grid(row=0, column=2, sticky='w', padx=(16, 0))
-        self.scale_var = tk.StringVar(value='2')
+        self.scale_var = tk.StringVar(value=f"{cfg.get('default_scale', 2.0):g}")
         self.scale_spin = ttk.Spinbox(grid, from_=0.1, to=20, increment=0.5, width=8,
                                       textvariable=self.scale_var, command=self.refresh_summary)
         self.scale_spin.grid(row=0, column=3, sticky='w', padx=4)
 
         ttk.Label(grid, text='循环次数').grid(row=1, column=0, sticky='w', pady=4)
-        self.repeat_var = tk.StringVar(value='1')
+        self.repeat_var = tk.StringVar(value=f"{cfg.get('default_repeat', 1):g}")
         ttk.Spinbox(grid, from_=1, to=100, increment=1, width=8,
                     textvariable=self.repeat_var, command=self.refresh_summary).grid(row=1, column=1, sticky='w', padx=4)
         self.gcj_var = tk.BooleanVar(value=False)
@@ -165,6 +175,7 @@ class App:
         return None
 
     def on_refresh(self):
+        self._load_presets()  # hot-reload speed presets from config on each refresh
         self.refresh_btn.configure(state='disabled')
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
@@ -196,6 +207,22 @@ class App:
         if path:
             self.path_var.set(path)
             self.refresh_summary()
+
+    def _load_presets(self, cfg=None):
+        cfg = cfg if cfg is not None else config.load_config()
+        self._presets = config.speed_presets(cfg)
+        values = [f"{p.get('label', '?')} ({p['kmh']:g} km/h)" for p in self._presets]
+        values.append('自定义…')
+        self.preset_combo['values'] = values
+        if cfg.get('_error'):
+            self.log_async(cfg['_error'])
+
+    def on_preset(self, event=None):
+        i = self.preset_combo.current()
+        self.mode_var.set('speed')
+        if 0 <= i < len(self._presets):
+            self.speed_var.set(f"{config.preset_speed_mps(self._presets[i]):.2f}")
+        self.on_mode()
 
     def on_mode(self):
         speed = self.mode_var.get() == 'speed'

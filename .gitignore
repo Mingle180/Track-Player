@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 
 # Generated playback files (recreate with trackprep.py)
 *.play.gpx
@@ -21,3 +22,7 @@ demo_loop3.gpx
 # Scratch / screenshots
 *.png
 *.jpg
+
+# Documentation assets (committed)
+!docs/*.png
+!docs/*.jpg

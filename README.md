@@ -1,8 +1,12 @@
 # Track Player
 
+![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey)
+
 在 **Windows** 上让 **iPhone 真机**沿指定 GPX/KML 轨迹移动定位，用于测试自研 App 的轨迹渲染/记录效果。**无需 Mac、无需越狱、无需修改 App 代码。**
 
-原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效）。本仓库在其上封装了统一命令 **`trackplayer`** 与图形界面 **`trackplayer-gui`**：一条命令（或一个窗口）完成「轨迹预处理 → 检测设备 → 播放 → 退出自动恢复真实定位」，无需手动拼接多个命令。
+原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效）。本仓库直接 import 它并**持有常开定位通道 + keep-alive**（播放期间通道不关闭、周期性重发当前坐标，抑制 iOS 融合定位回弹），在其上封装了统一命令 **`trackplayer`** 与图形界面 **`trackplayer-gui`**：一条命令（或一个窗口）完成「轨迹预处理 → 检测设备 → 播放 → 退出自动恢复真实定位」，无需手动拼接多个命令。
 
 > **pip 分发，无 exe**：`pip install track-player` 即装即用，不做 PyInstaller/exe 打包，因此没有 SmartScreen / 杀软误报问题。
 
@@ -10,7 +14,9 @@
 
 **`trackplayer-gui`（图形界面，最简单）**
 
-一个窗口搞定：刷新/选择设备 → 选轨迹文件（自动显示点数/里程/时长摘要）→ 设速度/倍速/循环/坐标系/时长 → 播放/停止 → 实时日志（含设备坐标）→ 退出自动恢复真实定位。播放中直接关窗也会先停止并恢复，不留残留模拟。
+一个窗口搞定：刷新/选择设备 → 选轨迹文件（自动显示点数/里程/时长摘要）→ 设速度（**预设步行/跑步/骑行/驾车**或自定义）/倍速/循环/坐标系/时长 → 播放/停止 → 实时日志（含设备坐标）→ 退出自动恢复真实定位。播放中直接关窗也会先停止并恢复，不留残留模拟。
+
+![Track Player 图形界面](docs/gui.png)
 
 **`trackplayer`（命令行，一条命令搞定）**
 
@@ -83,7 +89,7 @@ python -m trackplayer_gui
 
 1. **设备**：启动自动刷新；点「刷新设备」重新检测，下拉框选目标 iPhone（无设备时窗口给出引导文案）。
 2. **轨迹**：点「浏览…」选 `.gpx`/`.kml`，下方即时显示点数 / 里程 / 播放时长摘要。
-3. **参数**：定速 (m/s) 或倍速 (×) 二选一；循环次数；「源是 GCJ-02（高德/腾讯）」开关；时长（秒，留空=手动停止）。
+3. **参数**：先用「速度预设」下拉（步行/跑步/骑行/驾车，自动换算 m/s）或「自定义」；定速 (m/s) 或倍速 (×) 二选一；循环次数；「源是 GCJ-02（高德/腾讯）」开关；时长（秒，留空=手动停止）。
 4. **播放/停止**：点「播放」，日志区实时显示注入坐标与 pymobiledevice3 日志；点「停止」提前结束。
 5. **自动恢复**：停止 / 到时 / 播完 / 关窗都会自动 `clear` 恢复真实定位；也可随时点「恢复真实定位」。
 
@@ -91,13 +97,14 @@ python -m trackplayer_gui
 
 ```bash
 trackplayer play route.kml --speed 3 --repeat 2     # 预处理 + 播放，按回车停止并自动恢复
+trackplayer play route.gpx --preset 跑步            # 用配置里的速度预设（km/h 自动换算 m/s）
 trackplayer play amap_track.gpx --from-gcj02 --speed 3
 trackplayer play route.gpx --duration 120           # 播放 120 秒后自动停止并恢复
 trackplayer devices                                 # 列出已连接设备（含 UDID）
 trackplayer clear                                   # 立即恢复真实定位
 ```
 
-`play` 选项：`--speed`/`--scale`（二选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。多设备时必须用 `--udid` 指定。
+`play` 选项：`--speed`/`--scale`/`--preset`（三选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。多设备时必须用 `--udid` 指定。
 
 ### 方式三：trackprep + 官方命令（手动）
 
@@ -128,6 +135,30 @@ pymobiledevice3 developer dvt simulate-location clear
 
 多设备时给 pymobiledevice3 命令加 `--udid <UDID>`。
 
+## 配置（可选）
+
+内置默认配置可被用户文件 `~/.trackplayer/config.json`（Windows：`C:\Users\<你>\.trackplayer\config.json`）覆盖，GUI 点「刷新设备」即热加载，无需重启：
+
+```json
+{
+  "speed_presets": [
+    {"label": "步行", "kmh": 5},
+    {"label": "跑步", "kmh": 10},
+    {"label": "骑行", "kmh": 20},
+    {"label": "驾车", "kmh": 50}
+  ],
+  "default_speed_mps": 3.0,
+  "default_scale": 2.0,
+  "default_repeat": 1,
+  "keepalive_interval_s": 1.0
+}
+```
+
+- `speed_presets`：GUI 下拉与 `--preset` 用的速度预设（km/h，自动换算 m/s）。
+- `default_*`：GUI 参数初始值。
+- `keepalive_interval_s`：播完持有末点时重发坐标的间隔（抗回弹）。
+- 只需写你想改的键，其余沿用默认；文件缺失/损坏自动回退内置默认。
+
 ## 坐标系（重要）
 
 - **注入文件始终用 WGS-84。**
@@ -137,7 +168,9 @@ pymobiledevice3 developer dvt simulate-location clear
 
 ## 常见问题
 
-- **蓝点不动 / 回弹**（iOS 27 系统 Wi-Fi/基站融合定位纠偏）：开飞行模式 10 秒再关 + 彻底重启目标 App；备用：直接关 Wi-Fi。
+更多问题与排障见 **[FAQ.md](FAQ.md)**。
+
+- **蓝点不动 / 回弹**（iOS 27 系统 Wi-Fi/基站融合定位纠偏）：本工具已用常开通道 + keep-alive 抑制回弹；若仍回弹，开飞行模式 10 秒再关 + 彻底重启目标 App；备用：直接关 Wi-Fi。
 - 模拟**只替换 GPS 坐标**，不模拟计步器 / 运动传感器；若 App 融合步频判断运动状态需注意。
 - 模拟期间**全设备**定位都被替换；用 `trackplayer` 退出会自动恢复，手动方式结束后需 `clear`；异常时**重启手机必恢复**。
 - 播放期间断开 USB / Ctrl+C 后模拟失效。
@@ -160,8 +193,8 @@ pymobiledevice3 developer dvt simulate-location play pku.play.gpx
 
 ## 许可
 
-- `trackplayer.py`、`trackplayer_gui.py`、`trackprep.py` 及本仓库文档：**MIT**（见 [LICENSE](LICENSE)）。
-- pymobiledevice3 为独立外部依赖，**GPL-3.0**；本仓库仅以子进程调用其 CLI、不 import 它，不构成衍生作品。
+- 本仓库代码（`trackplayer.py`、`trackplayer_gui.py`、`trackplayer_config.py`、`trackprep.py`）及文档：**GPL-3.0-or-later**（见 [LICENSE](LICENSE)）。
+- 核心直接 import [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)（**GPL-3.0**）以持有常开 DVT 定位通道，本工具构成其衍生作品，故整体以 GPL-3.0 分发。设备列表仍以子进程调用其 CLI（`usbmux list`）。
 
 ## 参考
 
