@@ -2,10 +2,17 @@
 
 ## 安装与启动
 
-**Q：提示「找不到 trackplayer / trackplayer-gui 命令」？**
+**Q：推荐用哪种界面？**
+A：**首选 Web 地图界面**：`trackplayer web`（或 `trackplayer-web`）。它在高德底图上画出轨迹、播放时蓝点实时移动，最便于核对轨迹与自研 App 的对齐，还支持地图手绘轨迹；纯标准库实现，不依赖 tkinter。图形界面 `trackplayer-gui` 与命令行 `trackplayer play` 功能等价（共用同一播放核心），按习惯选用。
+
+**Q：怎么安装？**
+A：`pip install git+https://github.com/Mingle180/Track-Player.git`（未上架 PyPI），装好即有 `trackplayer`、`trackplayer-web` 与 `trackplayer-gui` 命令（自动带上 pymobiledevice3 依赖）。
+
+**Q：提示「找不到 trackplayer / trackplayer-web / trackplayer-gui 命令」？**
 A：Python 的 Scripts 目录没进 PATH。用不依赖 PATH 的兜底写法：
 
 ```bash
+python -m trackplayer_web      # Web 地图界面（首选）
 python -m trackplayer_gui      # 图形界面
 python -m trackplayer devices  # 命令行
 ```
@@ -13,10 +20,7 @@ python -m trackplayer devices  # 命令行
 或把 Python 的 `Scripts` 目录加入 PATH 后重开终端。
 
 **Q：启动 GUI 报「tkinter is not available」？**
-A：用的是不含 tcl/tk 的极简 Python 发行版。改装 [python.org](https://www.python.org/downloads/windows/) 的 Windows 安装包（自带 tkinter）。命令行不受影响。
-
-**Q：怎么安装？**
-A：`pip install git+https://github.com/Mingle180/Track-Player.git`，装好即有 `trackplayer` 与 `trackplayer-gui` 命令（自动带上 pymobiledevice3 依赖）。
+A：用的是不含 tcl/tk 的极简 Python 发行版。改装 [python.org](https://www.python.org/downloads/windows/) 的 Windows 安装包（自带 tkinter），或直接用不受影响的 **Web 界面**（`trackplayer web`）/ 命令行。
 
 ## 设备连接
 
@@ -28,7 +32,7 @@ A：逐项检查：
 4. 换一根数据线 / 换一个 USB 口（有些线只能充电）。
 
 **Q：连了多台设备怎么办？**
-A：`trackplayer devices` 列出所有 UDID，播放/恢复时用 `--udid <UDID>` 指定；GUI 在下拉框里选。
+A：`trackplayer devices` 列出所有 UDID，播放/恢复时用 `--udid <UDID>` 指定；Web / GUI 在下拉框里选。
 
 **Q：需要管理员权限吗？**
 A：**iOS 17.4+ 不需要**——自动建立免管理员的 userspace 隧道。iOS 17.0–17.3 在 Windows 需管理员 tunneld + 第三方驱动；iOS ≤16 走旧命令（详见 pymobiledevice3 文档）。
@@ -41,26 +45,26 @@ A：本工具现在**持有常开 DVT 通道并周期性 re-assert 当前坐标�
 - 备用：直接**关 Wi-Fi**（减少融合定位源）。
 
 **Q：播放一会儿就失效？**
-A：模拟依赖进程持有通道。**保持 USB 连接、保持 trackplayer/GUI 运行**。断开 USB 或结束进程后模拟失效；退出时会自动 `clear` 恢复真实定位。
+A：模拟依赖进程持有通道。**保持 USB 连接、保持 Web 服务 / GUI / trackplayer 运行**。断开 USB 或结束进程后模拟失效；退出时会自动 `clear` 恢复真实定位。
 
 **Q：能暂停吗？暂停时定位会回弹吗？**
-A：能。GUI / Web 点「暂停」，CLI 交互模式 `p`+回车。暂停时**冻结当前坐标**并继续 keep-alive 重发（抗回弹），通道保持不关；「继续」从暂停点恢复，`--duration` 时钟同步冻结（暂停不计入时长）。
+A：能。Web / GUI 点「暂停」，CLI 交互模式 `p`+回车。暂停时**冻结当前坐标**并继续 keep-alive 重发（抗回弹），通道保持不关；「继续」从暂停点恢复，`--duration` 时钟同步冻结（暂停不计入时长）。
 
 **Q：模拟会影响计步 / 运动状态吗？**
 A：只替换 **GPS 坐标**，不模拟计步器 / 运动传感器。若 App 融合步频判断运动状态需注意。
 
 **Q：模拟期间别的 App 定位也变了吗？**
-A：是的，**全设备**定位都被替换。用 `trackplayer` / GUI 退出会自动恢复；手动方式结束后需 `clear`；异常时**重启手机必恢复**。
+A：是的，**全设备**定位都被替换。用 Web / GUI / `trackplayer` 退出会自动恢复；手动方式结束后需 `clear`；异常时**重启手机必恢复**。
 
 ## 坐标系
 
 **Q：轨迹在高德底图上偏移约 500 m？**
 A：多半是**双重偏移**。注入文件始终用 **WGS-84**：
-- 轨迹源本身是 **GCJ-02**（高德/腾讯导出）→ 加 `--from-gcj02`（GUI 勾「源是 GCJ-02」）转回 WGS-84。
+- 轨迹源本身是 **GCJ-02**（高德/腾讯导出）→ 加 `--from-gcj02`（Web / GUI 勾「源是 GCJ-02」）转回 WGS-84。
 - 标准 GPX（WGS-84）→ 无需转换。
 
 **Q：支持 GeoJSON 吗？**
-A：支持。`.geojson` / `.json` 后缀的 `LineString` / `MultiLineString` / `Point` / `MultiPoint` / `FeatureCollection` 均可（CLI / GUI / Web 上传）。GeoJSON 无标准时间戳，按定速重采样；坐标默认 WGS-84，若源是 GCJ-02 勾「源是 GCJ-02」。
+A：支持。`.geojson` / `.json` 后缀的 `LineString` / `MultiLineString` / `Point` / `MultiPoint` / `FeatureCollection` 均可（Web 上传 / GUI / CLI）。GeoJSON 无标准时间戳，按定速重采样；坐标默认 WGS-84，若源是 GCJ-02 勾「源是 GCJ-02」。
 
 **Q：高德 SDK 的 App 显示正确吗？**
 A：国内（含港澳台）高德/腾讯 SDK 返回 GCJ-02，会自动给注入的 WGS-84 加偏，在高德底图上显示正确；海外原样返回 WGS-84。
@@ -68,7 +72,7 @@ A：国内（含港澳台）高德/腾讯 SDK 返回 GCJ-02，会自动给注入
 ## 速度与配置
 
 **Q：速度怎么设？**
-A：GUI 用「速度预设」下拉（步行/跑步/骑行/驾车，单位 km/h，自动换算 m/s），也可选「自定义」手动填 m/s；命令行用 `--speed <m/s>`、`--preset <名称>` 或 `--scale <倍数>`。
+A：Web / GUI 用「速度预设」下拉（步行/跑步/骑行/驾车，单位 km/h，自动换算 m/s），也可选「自定义」手动填 m/s；命令行用 `--speed <m/s>`、`--preset <名称>` 或 `--scale <倍数>`。
 
 **Q：能改预设 / 默认值吗？**
 A：能。编辑 `~/.trackplayer/config.json`（Windows 为 `C:\Users\<你>\.trackplayer\config.json`），覆盖内置默认：
@@ -86,9 +90,9 @@ A：能。编辑 `~/.trackplayer/config.json`（Windows 为 `C:\Users\<你>\.tra
 }
 ```
 
-GUI 点「刷新设备」即热加载，无需重启。文件缺失或损坏时回退内置默认。
+Web 刷新页面（F5）、GUI 点「刷新设备」即热加载，无需重启。文件缺失或损坏时回退内置默认。
 
-## Web 地图界面
+## Web 地图界面（首选）
 
 **Q：怎么打开 Web 界面？**
 A：`trackplayer web`（或 `trackplayer-web`），自动打开浏览器到 `http://127.0.0.1:8799`。服务仅绑定本机，不暴露到局域网；Ctrl+C 退出。

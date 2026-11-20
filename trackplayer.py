@@ -371,6 +371,7 @@ def main():
         description='Simulate iPhone GPS along a GPX/KML track on Windows; auto-restores real location on exit.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Examples:\n'
+               '  trackplayer web                     # preferred: browser map UI\n'
                '  trackplayer play route.kml --speed 3 --repeat 2\n'
                '  trackplayer play route.gpx --preset 跑步\n'
                '  trackplayer play amap.gpx --from-gcj02 --speed 3\n'
@@ -378,7 +379,6 @@ def main():
                '  trackplayer devices\n'
                '  trackplayer clear\n'
                '  trackplayer gui\n'
-               '  trackplayer web\n'
                '\n'
                'Requires iTunes (usbmux service) + an iPhone with Developer Mode enabled, USB-connected.\n'
                'Only GPS coordinates are simulated, not pedometer/motion sensors.')
@@ -404,13 +404,13 @@ def main():
     d = sub.add_parser('devices', help='list connected iPhones')
     d.set_defaults(func=cmd_devices)
 
-    gu = sub.add_parser('gui', help='launch the graphical interface (same as trackplayer-gui)')
-    gu.set_defaults(func=cmd_gui)
-
-    w = sub.add_parser('web', help='launch the browser map UI (local server + live map preview)')
+    w = sub.add_parser('web', help='launch the browser map UI (preferred; local server + live map preview)')
     w.add_argument('--port', type=int, default=8799, help='local port to bind (default 8799)')
     w.add_argument('--no-open', action='store_true', help='do not auto-open the browser')
     w.set_defaults(func=cmd_web)
+
+    gu = sub.add_parser('gui', help='launch the graphical interface (same as trackplayer-gui)')
+    gu.set_defaults(func=cmd_gui)
 
     args = ap.parse_args()
     args.func(args)
