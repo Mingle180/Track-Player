@@ -33,6 +33,7 @@ class App:
         self.state = IDLE
         self.devices = []
         self.stop_event = None
+        self.pause_event = None
         self.worker = None
         self._alive = True
 
@@ -116,8 +117,10 @@ class App:
         ctl.pack(fill='x', **pad)
         self.play_btn = ttk.Button(ctl, text='播放', command=self.on_play)
         self.play_btn.pack(side='left')
+        self.pause_btn = ttk.Button(ctl, text='暂停', command=self.on_pause, state='disabled')
+        self.pause_btn.pack(side='left', padx=(8, 0))
         self.stop_btn = ttk.Button(ctl, text='停止', command=self.on_stop, state='disabled')
-        self.stop_btn.pack(side='left', padx=8)
+        self.stop_btn.pack(side='left', padx=(8, 0))
         self.restore_btn = ttk.Button(ctl, text='恢复真实定位', command=self.on_restore)
         self.restore_btn.pack(side='left')
         self.status_var = tk.StringVar(value='空闲')
@@ -162,6 +165,9 @@ class App:
         self.state = state
         playing = state == PLAYING
         self.play_btn.configure(state='disabled' if playing else 'normal')
+        self.pause_btn.configure(state='normal' if playing else 'disabled')
+        if not playing:
+            self.pause_btn.configure(text='暂停')
         self.stop_btn.configure(state='normal' if playing else 'disabled')
         self.restore_btn.configure(state='disabled' if playing else 'normal')
         if status:
@@ -203,7 +209,8 @@ class App:
     # ---- track / params ----
     def on_browse(self):
         path = filedialog.askopenfilename(
-            title='选择轨迹文件', filetypes=[('GPX/KML 轨迹', '*.gpx *.kml'), ('所有文件', '*.*')])
+            title='选择轨迹文件',
+            filetypes=[('GPX/KML/GeoJSON 轨迹', '*.gpx *.kml *.geojson *.json'), ('所有文件', '*.*')])
         if path:
             self.path_var.set(path)
             self.refresh_summary()
@@ -275,6 +282,7 @@ class App:
             return
         udid = self.selected_udid()
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
         self.set_state(PLAYING, '播放中')
         self.worker = threading.Thread(
             target=self._play_worker,
@@ -286,7 +294,8 @@ class App:
         try:
             tp.play_track(path, speed=speed, scale=scale, repeat=repeat,
                           from_gcj02=self.gcj_var.get(), udid=udid, duration=duration,
-                          stop_event=self.stop_event, on_log=self.log_async,
+                          stop_event=self.stop_event, pause_event=self.pause_event,
+                          on_log=self.log_async,
                           notice='playing... (点击「停止」提前结束并恢复)')
             ok = True
         except (ValueError, RuntimeError) as e:
@@ -302,6 +311,18 @@ class App:
         if self.state == PLAYING and self.stop_event:
             self.status_var.set('正在恢复')
             self.stop_event.set()
+
+    def on_pause(self):
+        if self.state != PLAYING or not self.pause_event:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_btn.configure(text='暂停')
+            self.status_var.set('播放中')
+        else:
+            self.pause_event.set()
+            self.pause_btn.configure(text='继续')
+            self.status_var.set('已暂停（坐标冻结）')
 
     def on_restore(self):
         if self.state != IDLE:

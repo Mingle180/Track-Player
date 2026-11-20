@@ -2,12 +2,13 @@
 """Track Player — one-command iPhone GPS track simulation on Windows.
 
 Wraps trackprep (preprocessing) + pymobiledevice3 (DVT LocationSimulation):
-prepares a GPX/KML track, auto-detects the device, plays it over a persistent
-DVT location channel that is held open for the whole session, and restores real
-location automatically on exit (ENTER / Ctrl+C / --duration / error). While
-playing, the current coordinate is re-asserted on a keep-alive interval to resist
-iOS fusion-location snap-back; after the track ends the last position is held
-until stopped.
+prepares a GPX/KML/GeoJSON track, auto-detects the device, plays it over a
+persistent DVT location channel that is held open for the whole session, and
+restores real location automatically on exit (ENTER / Ctrl+C / --duration /
+error). While playing, the current coordinate is re-asserted on a keep-alive
+interval to resist iOS fusion-location snap-back; after the track ends the last
+position is held until stopped. Playback can be paused (position frozen and
+held, duration clock frozen) and resumed from the paused point.
 
 The UI-agnostic core is play_track(); the CLI (cmd_play/clear/devices) and the
 Tkinter GUI (trackplayer_gui) are thin wrappers around it.
@@ -120,27 +121,68 @@ def restore(udid):
               + str(e).strip(), file=sys.stderr)
 
 
-async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_point=None):
+async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_point=None,
+                      pause_event=None):
     loop = asyncio.get_running_loop()
     end = loop.time() + duration if duration else None
 
-    def stopped():
-        if stop_event is not None and stop_event.is_set():
-            return True
-        return end is not None and loop.time() >= end
+    def stop_set():
+        return stop_event is not None and stop_event.is_set()
 
-    async def nap(seconds):
-        # Sleep in small slices so a stop/duration deadline is honoured promptly.
-        deadline = loop.time() + seconds
-        while not stopped():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(0.1, remaining))
+    def paused():
+        return pause_event is not None and pause_event.is_set()
+
+    def stopped():
+        if stop_set():
+            return True
+        # The --duration clock freezes while paused (pause_gate shifts `end`).
+        if end is None or paused():
+            return False
+        return loop.time() >= end
 
     async with _location_channel(udid) as ls:
+        last = None
+
+        async def pause_gate():
+            """Freeze track progression while paused, holding the current coordinate.
+
+            Re-asserts the last position on the keep-alive interval so iOS fusion
+            location cannot snap back during a pause. Returns the seconds spent
+            paused so callers shift their own deadlines; `end` is shifted here.
+            """
+            nonlocal end
+            if not paused():
+                return 0.0
+            t0 = loop.time()
+            on_log('paused; holding current position (keep-alive)...')
+            while paused() and not stop_set():
+                if last is not None:
+                    await ls.set(last[0], last[1])
+                    if on_point is not None:
+                        on_point(last[0], last[1])
+                deadline = loop.time() + keepalive
+                while loop.time() < deadline and paused() and not stop_set():
+                    await asyncio.sleep(0.1)
+            spent = loop.time() - t0
+            if end is not None:
+                end += spent
+            if not stop_set():
+                on_log('resumed.')
+            return spent
+
+        async def nap(seconds):
+            # Sleep in small slices so stop/pause/duration react promptly.
+            deadline = loop.time() + seconds
+            while not stopped():
+                deadline += await pause_gate()
+                if stopped():
+                    return
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(0.1, remaining))
+
         try:
-            last = None
             prev_t = None
             for lat, lon, t in points:
                 if stopped():
@@ -151,6 +193,9 @@ async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_
                         await nap(dt)
                         if stopped():
                             break
+                await pause_gate()
+                if stopped():
+                    break
                 await ls.set(lat, lon)
                 on_log(f'set location to {lat:.6f} {lon:.6f}')
                 if on_point is not None:
@@ -175,19 +220,22 @@ async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_
 
 def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False,
                udid=None, duration=None, output=None,
-               stop_event=None, on_log=None, notice=None, on_point=None):
+               stop_event=None, on_log=None, notice=None, on_point=None, pause_event=None):
     """Prepare a track, play it on the device, and restore real location on exit.
 
-    UI-agnostic core shared by the CLI and the GUI.
+    UI-agnostic core shared by the CLI, the GUI and the Web UI.
     - on_log(line): receives progress/log lines (CLI passes print; GUI passes a
       thread-safe marshaller). Defaults to a no-op.
     - stop_event: threading.Event; setting it stops playback early (GUI stop
       button / CLI ENTER). None plays until the track ends, then holds position
       until Ctrl+C.
+    - pause_event: threading.Event; while set, track progression freezes and the
+      current coordinate is held (keep-alive re-asserts resist snap-back). The
+      --duration clock freezes too. Clearing it resumes from the paused point.
     - notice: optional line logged right after the track summary (CLI uses it
       for the "press ENTER / Ctrl+C" hint).
-    - on_point(lat, lon): called with each injected WGS-84 coordinate (feeding
-      and keep-alive hold), for live map previews. Defaults to a no-op.
+    - on_point(lat, lon): called with each injected WGS-84 coordinate (feeding,
+      pause hold and keep-alive hold), for live map previews. Defaults to a no-op.
     Validation failures raise ValueError; device/prep failures raise RuntimeError
     (so the GUI can catch and show a dialog instead of exiting).
     On return, real location has been restored.
@@ -221,7 +269,8 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
     logger, handler = _forward_pmd_logs(on_log)
     ok = False
     try:
-        asyncio.run(_play_async(points, udid, duration, stop_event, on_log, keepalive, on_point))
+        asyncio.run(_play_async(points, udid, duration, stop_event, on_log, keepalive, on_point,
+                                pause_event))
         ok = True
     except KeyboardInterrupt:
         pass
@@ -247,28 +296,39 @@ def cmd_play(args):
     if args.duration:
         notice = f'playing for {args.duration:g}s, then auto-restoring real location...'
     elif interactive:
-        notice = 'playing... press ENTER to stop and restore real location.'
+        notice = 'playing... ENTER stops, p+ENTER pauses/resumes (position held while paused).'
     else:
         notice = 'playing... press Ctrl+C to stop and restore real location.'
 
     stop_event = None
+    pause_event = None
     if interactive:
         stop_event = threading.Event()
+        pause_event = threading.Event()
 
-        def watch_enter():
-            try:
-                input()
-            except (EOFError, OSError):
-                pass
+        def watch_keys():
+            while True:
+                try:
+                    line = input()
+                except (EOFError, OSError):
+                    break
+                if line.strip().lower() in ('p', 'pause', 'resume'):
+                    if pause_event.is_set():
+                        pause_event.clear()
+                    else:
+                        pause_event.set()
+                else:
+                    break
             stop_event.set()
-        threading.Thread(target=watch_enter, daemon=True).start()
+        threading.Thread(target=watch_keys, daemon=True).start()
     elif args.duration:
         stop_event = threading.Event()
 
     try:
         play_track(args.input, speed=speed, scale=args.scale, repeat=args.repeat,
                    from_gcj02=args.from_gcj02, udid=args.udid, duration=args.duration,
-                   output=args.output, stop_event=stop_event, on_log=print, notice=notice)
+                   output=args.output, stop_event=stop_event, on_log=print, notice=notice,
+                   pause_event=pause_event)
     except (ValueError, RuntimeError) as e:
         sys.exit(str(e))
 
@@ -325,7 +385,7 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('play', help='prepare a track and play it on the device')
-    p.add_argument('input', help='input .gpx or .kml file')
+    p.add_argument('input', help='input .gpx / .kml / .geojson / .json file')
     p.add_argument('-o', '--output', help='keep the prepared .gpx at this path (default: not written)')
     g = p.add_mutually_exclusive_group()
     g.add_argument('--speed', type=float, metavar='MPS', help='constant speed in m/s, resampled to 1 Hz (e.g. 3 = running)')

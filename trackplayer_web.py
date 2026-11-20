@@ -13,10 +13,12 @@ is required; Leaflet is loaded from a CDN by the page.
 
 import argparse
 import json
+import os
 import queue
 import tempfile
 import threading
 import webbrowser
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -61,6 +63,7 @@ class State:
         self.upload_name = None
         self.playing = False
         self.stop_event = None
+        self.pause_event = None
 
     def set_upload(self, path, name):
         with self.lock:
@@ -124,12 +127,14 @@ def _play_worker(state, params):
         state.hub.publish({'type': 'point', 'lat': glat, 'lon': glon})
 
     stop = threading.Event()
+    pause = threading.Event()
     with state.lock:
         state.stop_event = stop
+        state.pause_event = pause
         state.playing = True
     state.hub.publish({'type': 'state', 'state': 'playing'})
     try:
-        tp.play_track(state.upload_path, stop_event=stop, on_log=on_log,
+        tp.play_track(state.upload_path, stop_event=stop, pause_event=pause, on_log=on_log,
                       on_point=on_point, **params)
     except (ValueError, RuntimeError) as e:
         state.hub.publish({'type': 'log', 'line': str(e)})
@@ -137,6 +142,7 @@ def _play_worker(state, params):
         with state.lock:
             state.playing = False
             state.stop_event = None
+            state.pause_event = None
         state.hub.publish({'type': 'state', 'state': 'idle'})
 
 
@@ -200,6 +206,10 @@ def _make_handler(state):
                     self._play()
                 elif path == '/api/stop':
                     self._stop()
+                elif path == '/api/pause':
+                    self._pause()
+                elif path == '/api/drawn':
+                    self._drawn()
                 elif path == '/api/clear':
                     self._clear()
                 else:
@@ -222,8 +232,8 @@ def _make_handler(state):
         def _upload(self):
             name = self._query().get('name', 'track.gpx')
             suffix = Path(name).suffix.lower()
-            if suffix not in ('.gpx', '.kml'):
-                raise ValueError('only .gpx / .kml files are supported')
+            if suffix not in ('.gpx', '.kml', '.geojson', '.json'):
+                raise ValueError('only .gpx / .kml / .geojson / .json files are supported')
             data = self._body()
             if not data:
                 raise ValueError('empty file')
@@ -262,6 +272,33 @@ def _make_handler(state):
                 ev.set()
             self._json({'ok': True})
 
+        def _pause(self):
+            want = bool(self._json_body().get('paused'))
+            with state.lock:
+                ev = state.pause_event
+                playing = state.playing
+            if not playing or ev is None:
+                raise ValueError('not playing')
+            if want:
+                ev.set()
+            else:
+                ev.clear()
+            state.hub.publish({'type': 'state', 'state': 'paused' if want else 'playing'})
+            self._json({'ok': True, 'paused': want})
+
+        def _drawn(self):
+            raw = self._json_body().get('points') or []
+            if len(raw) < 2:
+                raise ValueError('draw at least 2 points on the map first')
+            wgs = [trackprep.gcj02_to_wgs84(float(p[0]), float(p[1])) for p in raw]
+            points = [(lat, lon, trackprep.BASE_TIME + timedelta(seconds=i))
+                      for i, (lat, lon) in enumerate(wgs)]
+            fd, tmp = tempfile.mkstemp(suffix='.gpx', prefix='trackplayer_drawn_')
+            os.close(fd)
+            trackprep.write_gpx(tmp, points, 'drawn track')
+            state.set_upload(tmp, 'drawn track.gpx')
+            self._json({'ok': True, 'name': 'drawn track.gpx', 'summary': _summary(points)})
+
         def _clear(self):
             with state.lock:
                 if state.playing:
@@ -286,7 +323,9 @@ def _make_handler(state):
             try:
                 with state.lock:
                     playing = state.playing
-                send({'type': 'state', 'state': 'playing' if playing else 'idle'})
+                    paused = state.pause_event is not None and state.pause_event.is_set()
+                send({'type': 'state',
+                      'state': ('paused' if paused else 'playing') if playing else 'idle'})
                 while True:
                     try:
                         ev = q.get(timeout=15)
@@ -389,6 +428,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .hint { font-size:12px; color:#6b7280; margin-top:4px; }
   .status { font-size:13px; font-weight:600; margin-top:10px; }
   .status.playing { color:#16a34a; }
+  .status.paused { color:#d97706; }
   #summary { font-size:12px; color:#374151; margin-top:6px; }
   #log { margin-top:8px; height:180px; overflow-y:auto; background:#0f172a; color:#cbd5e1; font-family:Consolas,monospace; font-size:11px; padding:8px; border-radius:6px; white-space:pre-wrap; }
   .check { display:flex; align-items:center; gap:6px; font-size:13px; margin-top:8px; }
@@ -409,7 +449,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="hint" id="devhint"></div>
 
     <h2>轨迹</h2>
-    <input type="file" id="file" accept=".gpx,.kml">
+    <input type="file" id="file" accept=".gpx,.kml,.geojson,.json">
+    <div class="row" style="margin-top:8px">
+      <button id="draw">画轨迹</button>
+      <button id="undo" disabled>撤销点</button>
+      <button id="dclear" disabled>清空</button>
+      <button id="duse" disabled>用绘制轨迹</button>
+    </div>
+    <div class="hint" id="drawhint">点「画轨迹」后在地图上逐点点击生成路线（GCJ-02），再「用绘制轨迹」。</div>
     <div id="summary"></div>
 
     <h2>参数</h2>
@@ -428,6 +475,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <div class="btns">
       <button id="play" class="primary">播放</button>
+      <button id="pause" disabled>暂停</button>
       <button id="stop" disabled>停止</button>
       <button id="clear">恢复定位</button>
     </div>
@@ -444,13 +492,17 @@ const map = L.map('map').setView([39.9042, 116.4074], 12);
 L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
   { subdomains:'1234', maxZoom:18, attribution:'© 高德地图' }).addTo(map);
 let trackLine = null, marker = null, startMarker = null, totalPoints = 0, seen = 0;
+let curState = 'idle', hasTrack = false;
+let drawing = false, drawnPts = [], drawnLine = null, drawnDots = [];
 
 function log(line){ const el=$('log'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight; }
 function setStatus(s){
-  const playing = s === 'playing';
-  $('status').textContent = playing ? '播放中' : '空闲';
-  $('status').className = 'status' + (playing ? ' playing' : '');
-  $('play').disabled = playing; $('stop').disabled = !playing;
+  curState = s;
+  const active = s === 'playing' || s === 'paused';
+  $('status').textContent = s === 'playing' ? '播放中' : s === 'paused' ? '已暂停（坐标冻结）' : '空闲';
+  $('status').className = 'status' + (s === 'playing' ? ' playing' : s === 'paused' ? ' paused' : '');
+  $('play').disabled = active; $('stop').disabled = !active; $('pause').disabled = !active;
+  $('pause').textContent = s === 'paused' ? '继续' : '暂停';
 }
 function params(){
   const p = { repeat: $('repeat').value || 1, from_gcj02: $('gcj').checked ? 1 : 0 };
@@ -488,7 +540,7 @@ function drawTrack(points){
   map.fitBounds(trackLine.getBounds(), { padding:[30,30] });
 }
 async function preview(){
-  if (!$('file').files.length) return;
+  if (!hasTrack) return;
   const q = new URLSearchParams(params());
   try {
     const j = await api('/api/preview?' + q.toString());
@@ -501,6 +553,7 @@ async function upload(){
   const f = $('file').files[0]; if (!f) return;
   const buf = await f.arrayBuffer();
   await api('/api/track?name=' + encodeURIComponent(f.name), { method:'POST', body:buf });
+  hasTrack = true;
   await preview();
 }
 function ensureMarker(lat, lon){
@@ -508,6 +561,34 @@ function ensureMarker(lat, lon){
   else marker.setLatLng([lat,lon]);
   if ($('follow').checked && !map.getBounds().contains([lat,lon])) map.panTo([lat,lon]);
 }
+
+function redrawDrawn(){
+  if (drawnLine) map.removeLayer(drawnLine);
+  drawnDots.forEach(d => map.removeLayer(d)); drawnDots = [];
+  if (drawnPts.length >= 2) drawnLine = L.polyline(drawnPts, { color:'#f59e0b', weight:3, dashArray:'6 6' }).addTo(map);
+  for (const p of drawnPts) drawnDots.push(L.circleMarker(p, { radius:4, color:'#f59e0b', fillColor:'#f59e0b', fillOpacity:1 }).addTo(map));
+  $('undo').disabled = !drawnPts.length; $('dclear').disabled = !drawnPts.length; $('duse').disabled = drawnPts.length < 2;
+}
+function setDrawing(on){
+  drawing = on;
+  $('draw').textContent = on ? '结束绘制' : '画轨迹';
+  $('draw').classList.toggle('primary', on);
+  map.getContainer().style.cursor = on ? 'crosshair' : '';
+  $('drawhint').textContent = on ? '绘制中：点击地图添加点；「撤销点」回退、「用绘制轨迹」生成 GPX。'
+                                 : '点「画轨迹」后在地图上逐点点击生成路线（GCJ-02），再「用绘制轨迹」。';
+}
+map.on('click', e => { if (!drawing) return; drawnPts.push([e.latlng.lat, e.latlng.lng]); redrawDrawn(); });
+$('draw').onclick = () => setDrawing(!drawing);
+$('undo').onclick = () => { drawnPts.pop(); redrawDrawn(); };
+$('dclear').onclick = () => { drawnPts = []; redrawDrawn(); };
+$('duse').onclick = async () => {
+  try {
+    await api('/api/drawn', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ points: drawnPts }) });
+    hasTrack = true; setDrawing(false); drawnPts = []; redrawDrawn();
+    await preview();
+  } catch(e){ log(e.message); }
+};
+$('pause').onclick = () => api('/api/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ paused: curState !== 'paused' }) }).catch(e => log(e.message));
 
 $('refresh').onclick = refreshDevices;
 $('file').onchange = upload;
@@ -522,7 +603,7 @@ es.onmessage = ev => {
   const m = JSON.parse(ev.data);
   if (m.type === 'log') log(m.line);
   else if (m.type === 'state') setStatus(m.state);
-  else if (m.type === 'point'){ seen++; ensureMarker(m.lat, m.lon); $('status').textContent = `播放中 · ${seen}/${totalPoints||'?'} · ${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}`; }
+  else if (m.type === 'point'){ seen++; ensureMarker(m.lat, m.lon); $('status').textContent = `${curState === 'paused' ? '已暂停' : '播放中'} · ${seen}/${totalPoints||'?'} · ${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}`; }
 };
 refreshDevices(); loadConfig();
 </script>

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare GPX/KML tracks for: pymobiledevice3 developer dvt simulate-location play"""
+"""Prepare GPX/KML/GeoJSON tracks for: pymobiledevice3 developer dvt simulate-location play"""
 
 import argparse
+import json
 import math
 import sys
 import xml.etree.ElementTree as ET
@@ -67,6 +68,50 @@ def parse_kml(root):
                         coords.append((float(parts[1]), float(parts[0])))
             for i, (lat, lon) in enumerate(coords):
                 points.append((lat, lon, whens[i] if i < len(whens) else None))
+    return points
+
+
+def parse_geojson(obj):
+    """Collect (lat, lon, None) from GeoJSON LineString/MultiLineString/Point(s).
+
+    GeoJSON has no standard per-point timestamps, so times are left None and the
+    caller resamples by speed (same path as a timestamp-less GPX).
+    """
+    points = []
+
+    def add_coord(c):
+        if isinstance(c, (list, tuple)) and len(c) >= 2:
+            points.append((float(c[1]), float(c[0]), None))
+
+    def walk_geom(g):
+        if not isinstance(g, dict):
+            return
+        t = g.get('type')
+        coords = g.get('coordinates') or []
+        if t == 'LineString':
+            for c in coords:
+                add_coord(c)
+        elif t == 'MultiLineString':
+            for line in coords:
+                for c in line:
+                    add_coord(c)
+        elif t == 'Point':
+            add_coord(coords)
+        elif t == 'MultiPoint':
+            for c in coords:
+                add_coord(c)
+        elif t == 'GeometryCollection':
+            for sub in g.get('geometries') or []:
+                walk_geom(sub)
+
+    t = obj.get('type') if isinstance(obj, dict) else None
+    if t == 'FeatureCollection':
+        for f in obj.get('features') or []:
+            walk_geom(f.get('geometry'))
+    elif t == 'Feature':
+        walk_geom(obj.get('geometry'))
+    else:
+        walk_geom(obj)
     return points
 
 
@@ -181,15 +226,25 @@ def write_gpx(path, points, name):
 
 
 def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False):
-    """Parse a GPX/KML file and return a 1 Hz-timestamped WGS-84 point list."""
-    root = ET.parse(input_path).getroot()
-    tag = local(root.tag).lower()
-    if tag == 'gpx':
-        points = parse_gpx(root)
-    elif tag == 'kml':
-        points = parse_kml(root)
+    """Parse a GPX/KML/GeoJSON file and return a 1 Hz-timestamped WGS-84 point list."""
+    suffix = Path(input_path).suffix.lower()
+    if suffix in ('.geojson', '.json'):
+        try:
+            with open(input_path, encoding='utf-8') as f:
+                obj = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            sys.exit(f'error: invalid GeoJSON ({e})')
+        points = parse_geojson(obj)
     else:
-        sys.exit(f'error: unsupported root element <{tag}>, expected gpx or kml')
+        root = ET.parse(input_path).getroot()
+        tag = local(root.tag).lower()
+        if tag == 'gpx':
+            points = parse_gpx(root)
+        elif tag == 'kml':
+            points = parse_kml(root)
+        else:
+            sys.exit(f'error: unsupported root element <{tag}>, expected gpx or kml '
+                     f'(use .geojson/.json suffix for GeoJSON)')
     if len(points) < 2:
         sys.exit('error: need at least 2 track points')
 
@@ -213,7 +268,7 @@ def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Convert GPX/KML to a 1 Hz-timestamped GPX for pymobiledevice3 simulate-location play.',
+        description='Convert GPX/KML/GeoJSON to a 1 Hz-timestamped GPX for pymobiledevice3 simulate-location play.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Play: pymobiledevice3 developer dvt simulate-location play OUT.gpx\n'
                'Restore: pymobiledevice3 developer dvt simulate-location clear\n'
@@ -223,7 +278,7 @@ def main():
                '  - Simulation replaces location device-wide; run clear afterwards (reboot always restores).\n'
                '  - Only GPS coordinates are simulated, not pedometer/motion sensors.\n'
                '  - Multiple devices: add --udid <UDID> to the pymobiledevice3 command.')
-    ap.add_argument('input', help='input .gpx or .kml file')
+    ap.add_argument('input', help='input .gpx / .kml / .geojson / .json file')
     ap.add_argument('-o', '--output', help='output .gpx (default: <input>.play.gpx)')
     g = ap.add_mutually_exclusive_group()
     g.add_argument('--speed', type=float, metavar='MPS',
