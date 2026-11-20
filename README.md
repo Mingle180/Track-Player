@@ -56,7 +56,7 @@ pip install track-player        # 装好后即有 trackplayer 与 trackplayer-gu
 GUI 随包一起装，无需额外依赖（tkinter 为标准库）。仅发布在 GitHub 时可用：
 
 ```bash
-pip install git+https://github.com/<owner>/<repo>.git
+pip install git+https://github.com/Mingle180/Track-Player.git
 ```
 
 从源码安装（开发用）：
