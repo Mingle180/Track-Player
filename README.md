@@ -18,6 +18,10 @@
 
 ![Track Player 图形界面](docs/gui.png)
 
+**`trackplayer web`（浏览器地图界面，直观核对轨迹）**
+
+本地起一个网页（仅绑定 `127.0.0.1`），在 **高德底图（GCJ-02）** 上画出轨迹线，播放时**实时蓝点沿轨迹移动**并显示进度与当前坐标，便于直观核对轨迹与底图/自研 App 的对齐。设备选择、上传轨迹、速度预设、播放/停止/恢复定位都在网页里完成，与 GUI 共用同一播放核心。注入仍用 WGS-84，显示时自动转 GCJ-02 贴合高德底图。纯标准库实现（`http.server` + SSE），地图用 CDN 上的 Leaflet，**无需 API key、无额外 Python 依赖**。
+
 **`trackplayer`（命令行，一条命令搞定）**
 
 ```bash
@@ -135,6 +139,29 @@ pymobiledevice3 developer dvt simulate-location clear
 
 多设备时给 pymobiledevice3 命令加 `--udid <UDID>`。
 
+### 方式四：Web 地图界面（浏览器 + 实时地图）
+
+```bash
+trackplayer web                 # 起本地服务并自动打开浏览器（默认 http://127.0.0.1:8799）
+trackplayer web --port 8801     # 端口被占用时换一个
+trackplayer web --no-open       # 只起服务，不自动开浏览器
+# 等价独立命令：trackplayer-web
+```
+
+网页操作流：
+
+1. **设备**：启动自动检测，下拉选 iPhone（无设备给引导文案）。
+2. **轨迹**：点「选择文件」上传 `.gpx`/`.kml`，地图立即画出轨迹线（GCJ-02，贴合高德底图）并显示点数/里程/时长摘要。
+3. **参数**：速度预设（步行/跑步/骑行/驾车）或自定义定速/倍速、循环、时长、「源是 GCJ-02」开关、「地图跟随蓝点」。
+4. **播放**：点「播放」，蓝点沿轨迹实时移动，状态栏显示进度（已注入/总点数）与当前坐标，日志区实时刷新；「停止」提前结束，「恢复定位」立即还原。
+5. **自动恢复**：停止 / 到时 / 播完都会自动恢复真实定位。
+
+说明：
+
+- 服务**仅绑定本机 `127.0.0.1`**，不暴露到局域网；Ctrl+C 退出服务。
+- 地图底图用高德栅格瓦片、Leaflet 从 CDN 加载，**首次打开需联网**；仅供开发者本地测试使用。
+- 与 GUI/CLI 共用 `play_track` 核心，同一时刻只跑一个播放会话（单隧道）。
+
 ## 配置（可选）
 
 内置默认配置可被用户文件 `~/.trackplayer/config.json`（Windows：`C:\Users\<你>\.trackplayer\config.json`）覆盖，GUI 点「刷新设备」即热加载，无需重启：
@@ -193,7 +220,7 @@ pymobiledevice3 developer dvt simulate-location play pku.play.gpx
 
 ## 许可
 
-- 本仓库代码（`trackplayer.py`、`trackplayer_gui.py`、`trackplayer_config.py`、`trackprep.py`）及文档：**GPL-3.0-or-later**（见 [LICENSE](LICENSE)）。
+- 本仓库代码（`trackplayer.py`、`trackplayer_gui.py`、`trackplayer_web.py`、`trackplayer_config.py`、`trackprep.py`）及文档：**GPL-3.0-or-later**（见 [LICENSE](LICENSE)）。
 - 核心直接 import [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)（**GPL-3.0**）以持有常开 DVT 定位通道，本工具构成其衍生作品，故整体以 GPL-3.0 分发。设备列表仍以子进程调用其 CLI（`usbmux list`）。
 
 ## 参考

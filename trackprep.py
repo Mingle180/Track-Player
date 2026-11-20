@@ -143,9 +143,7 @@ def _tlon(x, y):
     return r
 
 
-def gcj02_to_wgs84(lat, lon):
-    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
-        return lat, lon
+def _gcj_delta(lat, lon):
     dlat = _tlat(lon - 105.0, lat - 35.0)
     dlon = _tlon(lon - 105.0, lat - 35.0)
     rad = lat / 180.0 * math.pi
@@ -153,7 +151,21 @@ def gcj02_to_wgs84(lat, lon):
     sqrtmagic = math.sqrt(magic)
     dlat = (dlat * 180.0) / ((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtmagic) * math.pi)
     dlon = (dlon * 180.0) / (GCJ_A / sqrtmagic * math.cos(rad) * math.pi)
-    return lat * 2 - (lat + dlat), lon * 2 - (lon + dlon)
+    return dlat, dlon
+
+
+def gcj02_to_wgs84(lat, lon):
+    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
+        return lat, lon
+    dlat, dlon = _gcj_delta(lat, lon)
+    return lat - dlat, lon - dlon
+
+
+def wgs84_to_gcj02(lat, lon):
+    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
+        return lat, lon
+    dlat, dlon = _gcj_delta(lat, lon)
+    return lat + dlat, lon + dlon
 
 
 def write_gpx(path, points, name):

@@ -120,7 +120,7 @@ def restore(udid):
               + str(e).strip(), file=sys.stderr)
 
 
-async def _play_async(points, udid, duration, stop_event, on_log, keepalive):
+async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_point=None):
     loop = asyncio.get_running_loop()
     end = loop.time() + duration if duration else None
 
@@ -153,15 +153,19 @@ async def _play_async(points, udid, duration, stop_event, on_log, keepalive):
                             break
                 await ls.set(lat, lon)
                 on_log(f'set location to {lat:.6f} {lon:.6f}')
+                if on_point is not None:
+                    on_point(lat, lon)
                 last = (lat, lon)
                 prev_t = t
             # Track finished: hold the last position, re-asserting it on the
             # keep-alive interval until stopped (also resists snap-back at rest).
-            if last is not None:
+            if last is not None and not stopped():
                 on_log(f'track finished; holding {last[0]:.6f} {last[1]:.6f} '
                        f'(keep-alive every {keepalive:g}s)...')
                 while not stopped():
                     await ls.set(last[0], last[1])
+                    if on_point is not None:
+                        on_point(last[0], last[1])
                     await nap(keepalive)
         finally:
             on_log('restoring real location...')
@@ -171,7 +175,7 @@ async def _play_async(points, udid, duration, stop_event, on_log, keepalive):
 
 def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False,
                udid=None, duration=None, output=None,
-               stop_event=None, on_log=None, notice=None):
+               stop_event=None, on_log=None, notice=None, on_point=None):
     """Prepare a track, play it on the device, and restore real location on exit.
 
     UI-agnostic core shared by the CLI and the GUI.
@@ -182,6 +186,8 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
       until Ctrl+C.
     - notice: optional line logged right after the track summary (CLI uses it
       for the "press ENTER / Ctrl+C" hint).
+    - on_point(lat, lon): called with each injected WGS-84 coordinate (feeding
+      and keep-alive hold), for live map previews. Defaults to a no-op.
     Validation failures raise ValueError; device/prep failures raise RuntimeError
     (so the GUI can catch and show a dialog instead of exiting).
     On return, real location has been restored.
@@ -215,7 +221,7 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
     logger, handler = _forward_pmd_logs(on_log)
     ok = False
     try:
-        asyncio.run(_play_async(points, udid, duration, stop_event, on_log, keepalive))
+        asyncio.run(_play_async(points, udid, duration, stop_event, on_log, keepalive, on_point))
         ok = True
     except KeyboardInterrupt:
         pass
@@ -294,6 +300,11 @@ def cmd_gui(args):
     trackplayer_gui.main()
 
 
+def cmd_web(args):
+    import trackplayer_web
+    trackplayer_web.serve(port=args.port, open_browser=not args.no_open)
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog='trackplayer',
@@ -307,6 +318,7 @@ def main():
                '  trackplayer devices\n'
                '  trackplayer clear\n'
                '  trackplayer gui\n'
+               '  trackplayer web\n'
                '\n'
                'Requires iTunes (usbmux service) + an iPhone with Developer Mode enabled, USB-connected.\n'
                'Only GPS coordinates are simulated, not pedometer/motion sensors.')
@@ -334,6 +346,11 @@ def main():
 
     gu = sub.add_parser('gui', help='launch the graphical interface (same as trackplayer-gui)')
     gu.set_defaults(func=cmd_gui)
+
+    w = sub.add_parser('web', help='launch the browser map UI (local server + live map preview)')
+    w.add_argument('--port', type=int, default=8799, help='local port to bind (default 8799)')
+    w.add_argument('--no-open', action='store_true', help='do not auto-open the browser')
+    w.set_defaults(func=cmd_web)
 
     args = ap.parse_args()
     args.func(args)
