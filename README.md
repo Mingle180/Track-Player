@@ -2,11 +2,17 @@
 
 在 **Windows** 上让 **iPhone 真机**沿指定 GPX/KML 轨迹移动定位，用于测试自研 App 的轨迹渲染/记录效果。**无需 Mac、无需越狱、无需修改 App 代码。**
 
-原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效）。本仓库在其上封装了一个统一命令 **`trackplayer`**：一条命令完成「轨迹预处理 → 检测设备 → 播放 → 退出自动恢复真实定位」，无需手动拼接多个命令。
+原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效）。本仓库在其上封装了统一命令 **`trackplayer`** 与图形界面 **`trackplayer-gui`**：一条命令（或一个窗口）完成「轨迹预处理 → 检测设备 → 播放 → 退出自动恢复真实定位」，无需手动拼接多个命令。
+
+> **pip 分发，无 exe**：`pip install track-player` 即装即用，不做 PyInstaller/exe 打包，因此没有 SmartScreen / 杀软误报问题。
 
 ## 功能
 
-**`trackplayer`（推荐，一条命令搞定）**
+**`trackplayer-gui`（图形界面，最简单）**
+
+一个窗口搞定：刷新/选择设备 → 选轨迹文件（自动显示点数/里程/时长摘要）→ 设速度/倍速/循环/坐标系/时长 → 播放/停止 → 实时日志（含设备坐标）→ 退出自动恢复真实定位。播放中直接关窗也会先停止并恢复，不留残留模拟。
+
+**`trackplayer`（命令行，一条命令搞定）**
 
 ```bash
 trackplayer play route.kml --speed 3 --repeat 2   # 预处理 + 检测 iPhone + 播放，回车停止并自动恢复
@@ -34,7 +40,7 @@ trackplayer clear                                 # 立即恢复真实定位
 
 - Windows 10/11
 - **iTunes**（提供 Apple Mobile Device Support / usbmux 服务，pymobiledevice3 在 Windows 依赖它识别 USB 设备）—— 苹果官网下载
-- Python 3.10+（实测 3.14）
+- Python 3.10+（实测 3.14）；图形界面用标准库 **tkinter**——python.org 的 Windows 安装包自带 tcl/tk，极简发行版若缺 tkinter 需补装（CLI 不受影响）
 - iPhone：开启**开发者模式**（设置 → 隐私与安全性 → 开发者模式 → 打开 → 重启确认），USB 连接并「信任此电脑」
 - **iOS 17.4+**：自动建立免管理员 userspace 隧道，无需 tunneld / Xcode
   - iOS 17.0–17.3 在 Windows 需管理员 tunneld + 第三方驱动；iOS ≤16 走旧命令 `developer simulate-location` + `mounter auto-mount`（详见 pymobiledevice3 文档）
@@ -44,7 +50,13 @@ trackplayer clear                                 # 立即恢复真实定位
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install track-player        # 装好后即有 trackplayer 命令（自动带上 pymobiledevice3 依赖）
+pip install track-player        # 装好后即有 trackplayer 与 trackplayer-gui 命令（自动带上 pymobiledevice3 依赖）
+```
+
+GUI 随包一起装，无需额外依赖（tkinter 为标准库）。仅发布在 GitHub 时可用：
+
+```bash
+pip install git+https://github.com/<owner>/<repo>.git
 ```
 
 从源码安装（开发用）：
@@ -55,7 +67,21 @@ pip install -e .
 
 ## 用法
 
-### 方式一：trackplayer（推荐）
+### 方式一：图形界面（最简单）
+
+```bash
+trackplayer-gui        # 或等价命令：trackplayer gui
+```
+
+操作流：
+
+1. **设备**：启动自动刷新；点「刷新设备」重新检测，下拉框选目标 iPhone（无设备时窗口给出引导文案）。
+2. **轨迹**：点「浏览…」选 `.gpx`/`.kml`，下方即时显示点数 / 里程 / 播放时长摘要。
+3. **参数**：定速 (m/s) 或倍速 (×) 二选一；循环次数；「源是 GCJ-02（高德/腾讯）」开关；时长（秒，留空=手动停止）。
+4. **播放/停止**：点「播放」，日志区实时显示注入坐标与 pymobiledevice3 日志；点「停止」提前结束。
+5. **自动恢复**：停止 / 到时 / 播完 / 关窗都会自动 `clear` 恢复真实定位；也可随时点「恢复真实定位」。
+
+### 方式二：trackplayer 命令行
 
 ```bash
 trackplayer play route.kml --speed 3 --repeat 2     # 预处理 + 播放，按回车停止并自动恢复
@@ -67,7 +93,7 @@ trackplayer clear                                   # 立即恢复真实定位
 
 `play` 选项：`--speed`/`--scale`（二选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。多设备时必须用 `--udid` 指定。
 
-### 方式二：trackprep + 官方命令（手动）
+### 方式三：trackprep + 官方命令（手动）
 
 **1. 预处理**
 
@@ -128,7 +154,7 @@ pymobiledevice3 developer dvt simulate-location play pku.play.gpx
 
 ## 许可
 
-- `trackplayer.py`、`trackprep.py` 及本仓库文档：**MIT**（见 [LICENSE](LICENSE)）。
+- `trackplayer.py`、`trackplayer_gui.py`、`trackprep.py` 及本仓库文档：**MIT**（见 [LICENSE](LICENSE)）。
 - pymobiledevice3 为独立外部依赖，**GPL-3.0**；本仓库仅以子进程调用其 CLI、不 import 它，不构成衍生作品。
 
 ## 参考
