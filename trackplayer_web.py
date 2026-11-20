@@ -30,6 +30,14 @@ import trackplayer_config as config
 MAX_PREVIEW_POINTS = 2000
 
 
+class _HTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind the same port and
+    # silently split requests between instances (a play on one, stop on the
+    # other leaves a hidden keep-alive holder). Refuse reuse there so a
+    # duplicate instance fails fast with the friendly bind error instead.
+    allow_reuse_address = os.name != 'nt'
+
+
 class Hub:
     """Fan-out playback events to all connected SSE subscribers."""
 
@@ -368,7 +376,7 @@ def _config_payload():
 def serve(port=8799, open_browser=True):
     state = State()
     try:
-        server = ThreadingHTTPServer(('127.0.0.1', port), _make_handler(state))
+        server = _HTTPServer(('127.0.0.1', port), _make_handler(state))
     except OSError as e:
         raise SystemExit(f'error: cannot bind 127.0.0.1:{port} ({e.strerror or e}). '
                          f'Pick a free port with --port, e.g. --port 8801.')
