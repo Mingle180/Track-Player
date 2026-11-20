@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Generated playback files (recreate with trackprep.py)
+*.play.gpx
+
+# Installers / large binaries
+iTunes/
+iTunes64Setup.exe
+
+# Local working / test artifacts (curated copies live in examples/)
+demo_route.gpx
+demo_loop3.gpx
+/whitehouse_run.py
+/whitehouse_run.gpx
+/whitehouse_run.kml
+/pku54_loop.gpx
+
+# Scratch / screenshots
+*.png
+*.jpg
