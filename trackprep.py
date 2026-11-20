@@ -168,6 +168,37 @@ def write_gpx(path, points, name):
     ET.ElementTree(gpx).write(path, encoding='utf-8', xml_declaration=True)
 
 
+def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False):
+    """Parse a GPX/KML file and return a 1 Hz-timestamped WGS-84 point list."""
+    root = ET.parse(input_path).getroot()
+    tag = local(root.tag).lower()
+    if tag == 'gpx':
+        points = parse_gpx(root)
+    elif tag == 'kml':
+        points = parse_kml(root)
+    else:
+        sys.exit(f'error: unsupported root element <{tag}>, expected gpx or kml')
+    if len(points) < 2:
+        sys.exit('error: need at least 2 track points')
+
+    if from_gcj02:
+        points = [(*gcj02_to_wgs84(lat, lon), t) for lat, lon, t in points]
+
+    if speed is not None:
+        points = resample(points, speed)
+    elif scale is not None:
+        if any(t is None for _, _, t in points):
+            sys.exit('error: --scale needs timestamps on every point; use --speed instead')
+        points = retime(points, scale)
+    elif all(t is not None for _, _, t in points):
+        points = normalize(points)
+    else:
+        print('note: missing timestamps, resampling at default --speed 3')
+        points = resample(points, 3.0)
+
+    return repeat(points, repeat_n)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Convert GPX/KML to a 1 Hz-timestamped GPX for pymobiledevice3 simulate-location play.',
@@ -200,33 +231,7 @@ def main():
     if args.repeat < 1:
         ap.error('--repeat must be >= 1')
 
-    root = ET.parse(args.input).getroot()
-    tag = local(root.tag).lower()
-    if tag == 'gpx':
-        points = parse_gpx(root)
-    elif tag == 'kml':
-        points = parse_kml(root)
-    else:
-        sys.exit(f'error: unsupported root element <{tag}>, expected gpx or kml')
-    if len(points) < 2:
-        sys.exit('error: need at least 2 track points')
-
-    if args.from_gcj02:
-        points = [(*gcj02_to_wgs84(lat, lon), t) for lat, lon, t in points]
-
-    if args.speed is not None:
-        points = resample(points, args.speed)
-    elif args.scale is not None:
-        if any(t is None for _, _, t in points):
-            sys.exit('error: --scale needs timestamps on every point; use --speed instead')
-        points = retime(points, args.scale)
-    elif all(t is not None for _, _, t in points):
-        points = normalize(points)
-    else:
-        print('note: missing timestamps, resampling at default --speed 3')
-        points = resample(points, 3.0)
-
-    points = repeat(points, args.repeat)
+    points = prepare(args.input, args.speed, args.scale, args.repeat, args.from_gcj02)
 
     out = args.output or str(Path(args.input).with_suffix('')) + '.play.gpx'
     write_gpx(out, points, Path(args.input).stem)

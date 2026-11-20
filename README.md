@@ -1,12 +1,25 @@
-# Virtual Runner
+# Track Player
 
 在 **Windows** 上让 **iPhone 真机**沿指定 GPX/KML 轨迹移动定位，用于测试自研 App 的轨迹渲染/记录效果。**无需 Mac、无需越狱、无需修改 App 代码。**
 
-原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效），配合本仓库的 `trackprep.py` 做轨迹预处理（格式转换 / 变速 / 循环 / 坐标系转换）。
+原理：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 通过苹果官方 DVT `LocationSimulation` 调试接口向设备注入 GPS 坐标（全设备生效）。本仓库在其上封装了一个统一命令 **`trackplayer`**：一条命令完成「轨迹预处理 → 检测设备 → 播放 → 退出自动恢复真实定位」，无需手动拼接多个命令。
 
 ## 功能
 
-`trackprep.py`（纯 Python 标准库，无第三方依赖）把 GPX/KML 统一转成「带 1 Hz 时间戳的标准 WGS-84 GPX」，再交给官方 CLI 播放：
+**`trackplayer`（推荐，一条命令搞定）**
+
+```bash
+trackplayer play route.kml --speed 3 --repeat 2   # 预处理 + 检测 iPhone + 播放，回车停止并自动恢复
+trackplayer devices                               # 列出已连接设备
+trackplayer clear                                 # 立即恢复真实定位
+```
+
+- 自动检测已连接 iPhone（多设备用 `--udid` 指定）
+- 自动预处理（GPX/KML 解析、变速、循环、坐标系转换）后播放
+- **退出时自动 `clear` 恢复真实定位**（Ctrl+C / 到时 / 播完都恢复），临时文件自动清理
+- `--duration <秒>`：到时自动停止并恢复，适合无人值守
+
+**`trackprep.py`（底层预处理核心，纯 Python 标准库，无第三方依赖）** 把 GPX/KML 统一转成「带 1 Hz 时间戳的标准 WGS-84 GPX」：
 
 - 解析 GPX（`trkpt`/`rtept`）与 KML（`LineString`、`gx:Track`）
 - `--speed <m/s>`：按固定速度沿轨迹插值，每秒一个点（跑步 3、骑车 5）
@@ -15,7 +28,7 @@
 - `--from-gcj02`：GCJ-02 源（高德/腾讯导出）转回 WGS-84
 - `-o out.gpx`：输出并打印点数 / 里程 / 播放时长
 
-播放与恢复使用 pymobiledevice3 官方命令（见下）。
+`trackplayer` 内部复用 `trackprep`，也可单独用 `trackprep.py` + pymobiledevice3 官方命令（见下）。
 
 ## 环境要求
 
@@ -31,10 +44,30 @@
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install pymobiledevice3
+pip install track-player        # 装好后即有 trackplayer 命令（自动带上 pymobiledevice3 依赖）
+```
+
+从源码安装（开发用）：
+
+```bash
+pip install -e .
 ```
 
 ## 用法
+
+### 方式一：trackplayer（推荐）
+
+```bash
+trackplayer play route.kml --speed 3 --repeat 2     # 预处理 + 播放，按回车停止并自动恢复
+trackplayer play amap_track.gpx --from-gcj02 --speed 3
+trackplayer play route.gpx --duration 120           # 播放 120 秒后自动停止并恢复
+trackplayer devices                                 # 列出已连接设备（含 UDID）
+trackplayer clear                                   # 立即恢复真实定位
+```
+
+`play` 选项：`--speed`/`--scale`（二选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。多设备时必须用 `--udid` 指定。
+
+### 方式二：trackprep + 官方命令（手动）
 
 **1. 预处理**
 
@@ -74,7 +107,7 @@ pymobiledevice3 developer dvt simulate-location clear
 
 - **蓝点不动 / 回弹**（iOS 27 系统 Wi-Fi/基站融合定位纠偏）：开飞行模式 10 秒再关 + 彻底重启目标 App；备用：直接关 Wi-Fi。
 - 模拟**只替换 GPS 坐标**，不模拟计步器 / 运动传感器；若 App 融合步频判断运动状态需注意。
-- 模拟期间**全设备**定位都被替换；结束后 `clear`，异常时**重启手机必恢复**。
+- 模拟期间**全设备**定位都被替换；用 `trackplayer` 退出会自动恢复，手动方式结束后需 `clear`；异常时**重启手机必恢复**。
 - 播放期间断开 USB / Ctrl+C 后模拟失效。
 
 ## 示例
@@ -83,6 +116,8 @@ pymobiledevice3 developer dvt simulate-location clear
 - `examples/whitehouse_run.py`：白宫环线生成器（海外 WGS-84 示例），运行后生成 `whitehouse_run.gpx/.kml`。
 
 ```bash
+trackplayer play examples/pku54_loop.gpx --speed 5 --repeat 3
+# 或手动：
 python trackprep.py examples/pku54_loop.gpx -o pku.play.gpx --speed 5 --repeat 3
 pymobiledevice3 developer dvt simulate-location play pku.play.gpx
 ```
@@ -93,8 +128,8 @@ pymobiledevice3 developer dvt simulate-location play pku.play.gpx
 
 ## 许可
 
-- `trackprep.py` 及本仓库文档：**MIT**（见 [LICENSE](LICENSE)）。
-- pymobiledevice3 为独立外部依赖，**GPL-3.0**；本仓库仅调用其 CLI、不 import 它，不构成衍生作品。
+- `trackplayer.py`、`trackprep.py` 及本仓库文档：**MIT**（见 [LICENSE](LICENSE)）。
+- pymobiledevice3 为独立外部依赖，**GPL-3.0**；本仓库仅以子进程调用其 CLI、不 import 它，不构成衍生作品。
 
 ## 参考
 

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "track-player"
+version = "0.1.0"
+description = "Simulate iPhone GPS along GPX/KML tracks on Windows for app testing (no Mac, no jailbreak, no app changes)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Track Player contributors" }]
+keywords = ["iphone", "gps", "gpx", "kml", "location", "simulation", "pymobiledevice3", "testing"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = ["pymobiledevice3"]
+
+[project.scripts]
+trackplayer = "trackplayer:main"
+
+[tool.setuptools]
+py-modules = ["trackplayer", "trackprep"]
