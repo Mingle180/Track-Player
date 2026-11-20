@@ -73,6 +73,12 @@ pip install -e .
 trackplayer-gui        # 或等价命令：trackplayer gui
 ```
 
+若提示「找不到命令」（Python 的 Scripts 目录未进 PATH），用不依赖 PATH 的兜底写法：
+
+```bash
+python -m trackplayer_gui
+```
+
 操作流：
 
 1. **设备**：启动自动刷新；点「刷新设备」重新检测，下拉框选目标 iPhone（无设备时窗口给出引导文案）。
