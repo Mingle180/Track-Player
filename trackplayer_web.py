@@ -13,10 +13,12 @@ is required; Leaflet is loaded from a CDN by the page.
 
 import argparse
 import json
+import math
 import os
 import queue
 import tempfile
 import threading
+import time
 import webbrowser
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 import trackprep
 import trackplayer as tp
 import trackplayer_config as config
+import trackplayer_store as store
 
 MAX_PREVIEW_POINTS = 2000
 
@@ -67,33 +70,69 @@ class State:
     def __init__(self):
         self.hub = Hub()
         self.lock = threading.Lock()
+        self.library_lock = threading.Lock()
         self.upload_path = None
         self.upload_name = None
         self.playing = False
+        self.play_path = None
         self.last_point = None
         self.stop_event = None
         self.pause_event = None
+        self.store_root = None
+        default = config.DEFAULT_CONFIG['state_save_interval_s']
+        try:
+            interval = float(config.load_config().get('state_save_interval_s', default))
+        except (TypeError, ValueError, OverflowError):
+            interval = default
+        self.save_interval = interval if math.isfinite(interval) and interval > 0 else default
+        self._last_save = None
 
     def set_upload(self, path, name):
         with self.lock:
             old = self.upload_path
             self.upload_path = path
             self.upload_name = name
-        if old and old != path:
+            if old != path and old != self.play_path:
+                _remove_upload(old)
+
+    def remember(self, lat, lon):
+        """Record the last injected GCJ-02 point; flush at most every save_interval."""
+        with self.lock:
+            self.last_point = (lat, lon)
+            now = time.monotonic()
+            if self._last_save is None or now - self._last_save >= self.save_interval:
+                self._last_save = now
+                self._flush_locked()
+
+    def flush_last_point(self):
+        with self.lock:
+            self._flush_locked()
+
+    def _flush_locked(self):
+        if self.last_point is not None:
             try:
-                Path(old).unlink()
+                store.save_last_point(*self.last_point, root=self.store_root)
             except OSError:
                 pass
 
+    def _forget_locked(self):
+        store.forget_last_point(root=self.store_root)
+        self.last_point = None
+        self._last_save = None
+
     def cleanup(self):
         with self.lock:
-            path = self.upload_path
+            if self.upload_path != self.play_path:
+                _remove_upload(self.upload_path)
             self.upload_path = None
-        if path:
-            try:
-                Path(path).unlink()
-            except OSError:
-                pass
+
+
+def _remove_upload(path):
+    if path:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _resolve_speed(params):
@@ -109,15 +148,28 @@ def _resolve_speed(params):
     return (float(speed) if speed else None), (float(scale) if scale else None)
 
 
+def _truthy(v):
+    return str(v if v is not None else '').lower() in ('1', 'true', 'on', 'yes')
+
+
+def _parse_source(path, from_gcj02):
+    try:
+        return trackprep.parse_track(path, from_gcj02)
+    except SystemExit as e:
+        raise ValueError(str(e)) from None
+
+
 def _prepare_params(params):
-    speed, scale = _resolve_speed(params)
+    script = params.get('script')
+    speed, scale = _resolve_speed(params) if script is None else (None, None)
     return {
         'speed': speed,
         'scale': scale,
         'repeat': int(params.get('repeat') or 1),
-        'from_gcj02': str(params.get('from_gcj02', '')).lower() in ('1', 'true', 'on', 'yes'),
+        'from_gcj02': _truthy(params.get('from_gcj02')),
         'udid': params.get('udid') or None,
         'duration': float(params['duration']) if params.get('duration') else None,
+        'script': script,
     }
 
 
@@ -127,34 +179,39 @@ def _summary(points):
     return {'n': len(points), 'km': round(dist / 1000, 3), 'dur_s': round(dur)}
 
 
-def _play_worker(state, params):
+def _play_worker(state, path, stop, pause, params):
     def on_log(line):
         state.hub.publish({'type': 'log', 'line': line})
 
     def on_point(lat, lon):
         glat, glon = trackprep.wgs84_to_gcj02(lat, lon)
-        with state.lock:
-            state.last_point = (glat, glon)
+        state.remember(glat, glon)
         state.hub.publish({'type': 'point', 'lat': glat, 'lon': glon})
 
-    stop = threading.Event()
-    pause = threading.Event()
     with state.lock:
-        state.stop_event = stop
-        state.pause_event = pause
-        state.playing = True
-    state.hub.publish({'type': 'state', 'state': 'playing'})
+        state.hub.publish({'type': 'state', 'state': 'paused' if pause.is_set() else 'playing'})
     try:
-        tp.play_track(state.upload_path, stop_event=stop, pause_event=pause, on_log=on_log,
+        tp.play_track(path, stop_event=stop, pause_event=pause, on_log=on_log,
                       on_point=on_point, **params)
     except (ValueError, RuntimeError) as e:
         state.hub.publish({'type': 'log', 'line': str(e)})
     finally:
         with state.lock:
+            state._flush_locked()
             state.playing = False
             state.stop_event = None
             state.pause_event = None
-        state.hub.publish({'type': 'state', 'state': 'idle'})
+            state.play_path = None
+            if path != state.upload_path:
+                _remove_upload(path)
+            state.hub.publish({'type': 'state', 'state': 'idle'})
+
+
+def _display_points(points):
+    if len(points) > MAX_PREVIEW_POINTS:
+        step = len(points) / MAX_PREVIEW_POINTS
+        points = [points[int(i * step)] for i in range(MAX_PREVIEW_POINTS)] + [points[-1]]
+    return [trackprep.wgs84_to_gcj02(lat, lon) for lat, lon, _ in points]
 
 
 def _make_handler(state):
@@ -192,7 +249,16 @@ def _make_handler(state):
 
         def _json_body(self):
             raw = self._body()
-            return json.loads(raw) if raw else {}
+            obj = json.loads(raw) if raw else {}
+            if not isinstance(obj, dict):
+                raise ValueError('expected a JSON object')
+            return obj
+
+        def _source_path(self):
+            # Caller holds state.lock so the current upload cannot be replaced while in use.
+            if not state.upload_path:
+                raise ValueError('no track uploaded yet')
+            return state.upload_path
 
         # -- routes --
         def do_GET(self):
@@ -207,6 +273,8 @@ def _make_handler(state):
                                 'last_point': list(lp) if lp else None})
                 elif path == '/api/config':
                     self._json(_config_payload())
+                elif path == '/api/tracks':
+                    self._tracks_list()
                 elif path == '/api/preview':
                     self._preview()
                 elif path == '/api/stream':
@@ -215,8 +283,8 @@ def _make_handler(state):
                     self._json({'error': 'not found'}, 404)
             except (ValueError, RuntimeError) as e:
                 self._json({'error': str(e)}, 400)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
             except Exception as e:
                 self._json({'error': str(e)}, 500)
 
@@ -234,6 +302,18 @@ def _make_handler(state):
                     self._pause()
                 elif path == '/api/drawn':
                     self._drawn()
+                elif path == '/api/preview':
+                    self._preview(self._json_body())
+                elif path == '/api/script/project':
+                    self._project()
+                elif path == '/api/tracks/save':
+                    self._tracks_save()
+                elif path == '/api/tracks/load':
+                    self._tracks_load()
+                elif path == '/api/tracks/update':
+                    self._tracks_update()
+                elif path == '/api/tracks/delete':
+                    self._tracks_delete()
                 elif path == '/api/clear':
                     self._clear()
                 else:
@@ -241,8 +321,8 @@ def _make_handler(state):
             except (ValueError, RuntimeError) as e:
                 self._drain()
                 self._json({'error': str(e)}, 400)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
             except Exception as e:
                 self._drain()
                 self._json({'error': str(e)}, 500)
@@ -269,26 +349,54 @@ def _make_handler(state):
             state.set_upload(tmp, name)
             self._json({'ok': True, 'name': name})
 
-        def _preview(self):
-            if not state.upload_path:
-                raise ValueError('no track uploaded yet')
-            params = _prepare_params(self._query())
-            points = trackprep.prepare(state.upload_path, params['speed'], params['scale'],
-                                       params['repeat'], params['from_gcj02'])
-            disp = [trackprep.wgs84_to_gcj02(lat, lon) for lat, lon, _ in points]
-            if len(disp) > MAX_PREVIEW_POINTS:
-                step = len(disp) / MAX_PREVIEW_POINTS
-                disp = [disp[int(i * step)] for i in range(MAX_PREVIEW_POINTS)] + [disp[-1]]
-            self._json({'name': state.upload_name, 'points': disp, 'summary': _summary(points)})
+        def _preview(self, params=None):
+            # A GET remains the legacy preview. The editor can request raw geometry via POST.
+            include_source = params is not None and _truthy(params.get('include_source'))
+            if params is None:
+                params = self._query()
+                params.pop('script', None)
+            options = _prepare_params(params)
+            script, repeat = options['script'], options['repeat']
+            gcj = options['from_gcj02']
+            src = None
+            with state.lock:
+                path = self._source_path()
+                name = state.upload_name
+                if include_source or script is not None:
+                    src = _parse_source(path, gcj)
+                if script is None:
+                    try:
+                        points = trackprep.prepare(path, options['speed'], options['scale'], repeat, gcj)
+                    except SystemExit as e:
+                        raise ValueError(str(e)) from None
+            if script is not None:
+                points = trackprep.repeat(trackprep.compile_script(src, script, repeat), repeat)
+            out = {'name': name, 'points': _display_points(points), 'summary': _summary(points)}
+            if src is not None:
+                cum = trackprep.cumulative_lengths(src)
+                out['source_m'] = cum[-1]
+                out['source_points'] = _display_points(src)
+            if script is not None:
+                out['leg_marks'] = [list(trackprep.wgs84_to_gcj02(
+                    *trackprep.point_at(src, cum, float(leg['to_m']))))
+                    for leg in script if leg['type'] == 'move']
+            self._json(out)
 
         def _play(self):
-            if not state.upload_path:
-                raise ValueError('no track uploaded yet')
+            params = _prepare_params(self._json_body())
             with state.lock:
+                path = self._source_path()
                 if state.playing:
                     raise ValueError('already playing')
-            params = _prepare_params(self._json_body())
-            threading.Thread(target=_play_worker, args=(state, params), daemon=True).start()
+                if params['script'] is not None:
+                    src = _parse_source(path, params['from_gcj02'])
+                    trackprep.validate_script(src, params['script'], params['repeat'])
+                stop, pause = threading.Event(), threading.Event()
+                worker = threading.Thread(target=_play_worker, args=(state, path, stop, pause, params), daemon=True)
+                worker.start()
+                state.stop_event, state.pause_event = stop, pause
+                state.playing = True
+                state.play_path = path
             self._json({'ok': True})
 
         def _stop(self):
@@ -325,12 +433,88 @@ def _make_handler(state):
             state.set_upload(tmp, 'drawn track.gpx')
             self._json({'ok': True, 'name': 'drawn track.gpx', 'summary': _summary(points)})
 
+        def _project(self):
+            body = self._json_body()
+            try:
+                glat, glon = float(body['lat']), float(body['lon'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise ValueError('lat and lon must be valid coordinates') from None
+            if not (-90 <= glat <= 90 and -180 <= glon <= 180):
+                raise ValueError('lat and lon must be valid coordinates')
+            with state.lock:
+                src = _parse_source(self._source_path(), _truthy(body.get('from_gcj02')))
+            cum = trackprep.cumulative_lengths(src)
+            lat, lon = trackprep.gcj02_to_wgs84(glat, glon)
+            along, slat, slon = trackprep.project_point(src, cum, lat, lon)
+            g = trackprep.wgs84_to_gcj02(slat, slon)
+            self._json({'at_m': along, 'lat': g[0], 'lon': g[1], 'total_m': cum[-1]})
+
+        def _tracks_list(self):
+            with state.library_lock:
+                tracks = store.list_tracks(root=state.store_root)
+            self._json({'tracks': tracks})
+
+        def _tracks_save(self):
+            body = self._json_body()
+            gcj = _truthy(body.get('from_gcj02'))
+            script = body.get('script')
+            with state.lock:
+                path = self._source_path()
+                src = _parse_source(path, gcj)
+                if script is not None and script != []:
+                    trackprep.validate_script(src, script)
+                km = trackprep.cumulative_lengths(src)[-1] / 1000
+                with state.library_lock:
+                    meta = store.save_track(path, body.get('name') or state.upload_name,
+                                            from_gcj02=gcj, script=script,
+                                            km=round(km, 3), n=len(src), root=state.store_root)
+            self._json({'ok': True, 'id': meta['id'], 'name': meta['name']})
+
+        def _tracks_load(self):
+            tid = self._json_body().get('id')
+            with state.library_lock:
+                meta, src = store.load_track(tid, root=state.store_root)
+                data = src.read_bytes()
+            fd, tmp = tempfile.mkstemp(suffix=meta['suffix'], prefix='trackplayer_lib_')
+            with open(fd, 'wb') as f:
+                f.write(data)
+            state.set_upload(tmp, meta['name'])
+            self._json({'ok': True, 'id': meta['id'], 'name': meta['name'],
+                        'suffix': meta['suffix'], 'from_gcj02': meta['from_gcj02'],
+                        'script': meta.get('script') or []})
+
+        def _tracks_update(self):
+            body = self._json_body()
+            tid = body.get('id')
+            with state.library_lock:
+                old, path = store.load_track(tid, root=state.store_root)
+                gcj = _truthy(body['from_gcj02']) if 'from_gcj02' in body else old['from_gcj02']
+                if 'script' in body or gcj != old['from_gcj02']:
+                    script = body.get('script', old.get('script'))
+                    src = _parse_source(path, gcj)
+                    if script is not None and script != []:
+                        trackprep.validate_script(src, script)
+                    km = round(trackprep.cumulative_lengths(src)[-1] / 1000, 3)
+                    meta = store.update_track(tid, name=body.get('name'), from_gcj02=gcj,
+                                              script=script, km=km, root=state.store_root)
+                else:
+                    meta = store.update_track(tid, name=body.get('name'), root=state.store_root)
+            self._json({'ok': True, 'id': meta['id'], 'name': meta['name']})
+
+        def _tracks_delete(self):
+            tid = self._json_body().get('id')
+            with state.library_lock:
+                store.delete_track(tid, root=state.store_root)
+            self._json({'ok': True})
+
         def _clear(self):
+            requested = self._json_body().get('udid')
             with state.lock:
                 if state.playing:
                     raise ValueError('stop playback before clearing')
-            udid = tp.pick_device(self._json_body().get('udid'))
-            tp.restore(udid)
+                udid = tp.pick_device(requested)
+                tp.restore(udid)
+                state._forget_locked()
             state.hub.publish({'type': 'log', 'line': 'real location restored.'})
             self._json({'ok': True})
 
@@ -391,8 +575,10 @@ def _config_payload():
     }
 
 
-def serve(port=8799, open_browser=True):
+def serve(port=8799, open_browser=True, store_root=None):
     state = State()
+    state.store_root = store_root
+    state.last_point = store.load_last_point(store_root)
     try:
         server = _HTTPServer(('127.0.0.1', port), _make_handler(state))
     except OSError as e:
@@ -413,6 +599,7 @@ def serve(port=8799, open_browser=True):
             ev.set()
         server.shutdown()
         server.server_close()
+        state.flush_last_point()
         state.cleanup()
 
 
@@ -538,6 +725,31 @@ button.side-item.active{font-weight:500}
 input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .unit{font-size:.75rem;color:var(--text-2)}
+/* 分段脚本 */
+.script-bar{display:flex;align-items:center;gap:6px;padding:6px;flex-wrap:wrap}
+.script-bar .sp{flex:1}
+#script-total{font-size:.75rem;color:var(--text-3);font-variant-numeric:tabular-nums}
+#legs{max-width:640px}
+.leg-f .unit{flex:none;white-space:nowrap}
+.leg{display:grid;grid-template-columns:20px 40px 1fr 1fr 28px;align-items:center;gap:6px;
+     padding:4px 6px;border-radius:var(--r-md)}
+.leg:hover{background:var(--bg-hover)}
+.leg-i{font-size:.75rem;color:var(--text-3);text-align:right}
+.leg-k{font-size:.75rem;color:var(--text-2)}
+.leg-f{display:flex;align-items:center;gap:4px;min-width:0}
+.leg-f input{width:100%;min-width:0;border:1px solid transparent;background:transparent;color:var(--text);
+     font:inherit;padding:4px 6px;border-radius:var(--r-md);min-height:28px}
+.leg-f input:hover{background:var(--bg-sidebar);border-color:var(--border)}
+.leg-f input:focus{background:var(--bg-page);border-color:var(--accent)}
+#script-hint{font-size:.75rem;color:var(--text-3);padding:4px 6px}
+#sec-lib .block-hd{flex-wrap:wrap}
+.lib-row{display:grid;grid-template-columns:minmax(0,1fr) auto 52px;align-items:center;gap:6px;
+         padding:4px 6px;border-radius:var(--r-md)}
+.lib-row:hover{background:var(--bg-hover)}
+.lib-load{text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lib-meta,.lib-empty{font-size:.75rem;color:var(--text-3)}
+.lib-empty{padding:6px}
+.lib-delete{padding:0 4px}
 #summary{font-size:.8125rem;color:var(--text-2)}
 
 /* 状态 chip */
@@ -723,7 +935,9 @@ html[data-theme="dark"] #draw-badge{background:var(--accent);color:var(--bg-page
     <div class="side-brand"><span>📍</span><span>Track Player</span></div>
     <div class="side-sec">导航</div>
     <a class="side-item active" href="#sec-play" data-spy="sec-play">▶️ 播放台</a>
+    <a class="side-item" href="#sec-lib" data-spy="sec-lib">📚 轨迹库</a>
     <a class="side-item" href="#sec-map" data-spy="sec-map">🗺️ 轨迹地图</a>
+    <a class="side-item" href="#sec-script" data-spy="sec-script">🧩 分段停留</a>
     <a class="side-item" href="#sec-log" data-spy="sec-log">📜 运行日志</a>
     <div class="side-spacer"></div>
     <div class="device-card" id="device-card">
@@ -784,6 +998,15 @@ html[data-theme="dark"] #draw-badge{background:var(--accent);color:var(--bg-page
           <label for="gcj" data-tip="高德/腾讯导出的轨迹需勾选，否则会双重偏移约 500 m。">源是 GCJ-02（高德/腾讯）</label></span></div>
     </section>
 
+    <section class="block" id="sec-lib">
+      <div class="block-hd"><span>📚 轨迹库</span><span class="sp"></span>
+        <button class="icon ghost" id="lib-refresh" aria-label="刷新轨迹库" title="刷新">↻</button>
+        <button id="lib-update" hidden>更新库中条目</button>
+        <button id="lib-save">保存当前轨迹</button>
+      </div>
+      <div id="lib-list" aria-live="polite"></div>
+    </section>
+
     <section class="block" id="sec-map">
       <div class="block-hd"><span>🗺️ 地图 · 高德 GCJ-02</span><span class="sp"></span></div>
       <div id="map-wrap">
@@ -812,6 +1035,29 @@ html[data-theme="dark"] #draw-badge{background:var(--accent);color:var(--bg-page
         <div id="progress"><div id="progress-bar"></div></div>
         <span id="progress-label">0 / 0</span>
         <span id="coord">—</span>
+      </div>
+    </section>
+
+    <section class="block" id="sec-script">
+      <button class="toggle-hd" id="script-toggle" aria-expanded="false" aria-controls="script-bd">
+        <span class="caret">▸</span> 分段速度与停留点
+      </button>
+      <div class="toggle-bd" id="script-bd" hidden>
+        <div class="prop"><span class="k">启用</span>
+          <span class="v"><input type="checkbox" class="switch" id="script-on" role="switch">
+          <label for="script-on" data-tip="开启后按下面的脚本播放，速度预设/定速/倍速不再生效。">用脚本代替统一速度</label></span></div>
+        <div id="script-body" hidden>
+          <div class="script-bar">
+            <button id="leg-move">＋ 移动段</button>
+            <button id="leg-stay">＋ 停留点</button>
+            <button id="leg-pick">📍 地图选点</button>
+            <button id="leg-end">移动到终点</button>
+            <span class="sp"></span>
+            <span id="script-total">共 — m</span>
+          </div>
+          <div id="legs"></div>
+          <div id="script-hint"></div>
+        </div>
       </div>
     </section>
 
@@ -884,6 +1130,9 @@ let trackLine = null, marker = null, startMarker = null, totalPoints = 0, seen =
 let curState = 'idle', hasTrack = false, restoring = false, detecting = false;
 let drawing = false, drawnPts = [], drawnLine = null, drawnDots = [];
 let mode = 'speed', cfgDefaults = { speed:3, scale:2 };
+let scriptOn = false, legs = [], sourceM = 0, legMarkers = [], picking = false;
+let sourceBusy = false, fitPreview = true, scriptReady = false, pickSeq = 0, pickPending = false;
+let libId = null, librarySeq = 0;
 
 const LOG_MAX = 500; let logBuf = [], logRaf = 0;
 function classify(line){
@@ -972,7 +1221,7 @@ async function busy(btn, fn){
   finally {
     btn.removeAttribute('aria-busy');
     // 状态按钮的 disabled 由 syncButtons 裁决，回填旧值会覆盖播放锁
-    if (['play','pause','stop','clear','refresh'].includes(btn.id)) syncButtons();
+    if (['play','pause','stop','clear','refresh','lib-save','lib-update'].includes(btn.id)) syncButtons();
     else btn.disabled = was;
   }
 }
@@ -1027,8 +1276,9 @@ function renderProgress(){
 function syncButtons(){
   const active = curState === 'playing' || curState === 'paused';
   const dev = !!$('device').value, lock = restoring || detecting || curState === 'error';
-  $('play').disabled = active || lock || !hasTrack || !dev;
-  $('play').setAttribute('data-tip', !dev ? '请先连接 iPhone。' : !hasTrack ? '请先上传或绘制轨迹。' : active ? '已有播放会话。' : '开始播放（Alt+P）。');
+  const invalidScript = scriptOn && !scriptReady;
+  $('play').disabled = active || lock || !hasTrack || !dev || sourceBusy || invalidScript;
+  $('play').setAttribute('data-tip', !dev ? '请先连接 iPhone。' : !hasTrack ? '请先上传或绘制轨迹。' : active ? '已有播放会话。' : invalidScript ? '请先设置并预览有效脚本。' : '开始播放（Alt+P）。');
   $('pause').disabled = !active || lock;
   $('pause').setAttribute('data-tip', active ? (curState === 'paused' ? '继续播放（Alt+P）。' : '暂停播放（Alt+P）。') : '播放中才能暂停。');
   $('stop').disabled = !active || lock;
@@ -1036,6 +1286,11 @@ function syncButtons(){
   $('clear').disabled = active || lock;
   $('clear').setAttribute('data-tip', active ? '播放中不能恢复定位，请先停止。' : '立即恢复真实定位（Alt+R）。');
   $('refresh').disabled = detecting;
+  $('lib-save').disabled = !hasTrack || sourceBusy || (invalidScript && legs.length > 0) || $('lib-save').hasAttribute('aria-busy');
+  $('lib-update').disabled = $('lib-save').disabled || $('lib-update').hasAttribute('aria-busy');
+  $('lib-update').hidden = !libId;
+  $('leg-pick').disabled = !hasTrack || sourceBusy;
+  $('leg-end').disabled = !hasTrack || sourceBusy || sourceM <= cursorM();
 }
 function setStatus(s){
   curState = s;
@@ -1070,10 +1325,14 @@ function renderContext(){
 }
 function params(){
   const p = { repeat: $('repeat').value || 1, from_gcj02: $('gcj').checked ? 1 : 0 };
-  const preset = $('preset').value;
-  if (preset && preset !== '__custom') p.preset = preset;
-  else if ($('speed').value) p.speed = $('speed').value;
-  else if ($('scale').value) p.scale = $('scale').value;
+  if (scriptOn && legs.length){
+    p.script = legs;
+  } else {
+    const preset = $('preset').value;
+    if (preset && preset !== '__custom') p.preset = preset;
+    else if ($('speed').value) p.speed = $('speed').value;
+    else if ($('scale').value) p.scale = $('scale').value;
+  }
   if ($('duration').value) p.duration = $('duration').value;
   if ($('device').value) p.udid = $('device').value;
   return p;
@@ -1111,7 +1370,7 @@ async function refreshDevices(){
     showDevice();
     if (j.last_point && !marker){
       const [glat, glon] = j.last_point;
-      map.setView([glat, glon], 16);
+      map.setView([glat, glon], 16, { animate:false });
     }
   } catch(e){ handleError(e); }
   finally {
@@ -1134,7 +1393,9 @@ async function loadConfig(){
 function syncPreset(){
   const sel = $('preset');
   const custom = sel.value === '__custom' || !sel.options.length;
-  ['seg-speed','seg-scale','speed','scale'].forEach(id => $(id).disabled = !custom);
+  const off = scriptOn;
+  ['seg-speed','seg-scale','speed','scale'].forEach(id => $(id).disabled = !custom || off);
+  sel.disabled = off;
   if (!custom){ $('speed').value = ''; $('scale').value = ''; return; }
   const f = mode === 'speed' ? 'speed' : 'scale';
   if (!$(f).value) $(f).value = cfgDefaults[f];
@@ -1156,11 +1417,64 @@ function restyleLayers(){
   if (drawnLine) drawnLine.setStyle({ color:token('--draw') });
   drawnDots.forEach(d => d.setStyle({ color:token('--bg-page'), fillColor:token('--draw') }));
 }
+function cursorM(){ let c = 0; for (const l of legs) if (l.type === 'move') c = l.to_m; return c; }
+const scriptHelp = '移动段使用距起点的累计米数。停留发生在上一段终点，或轨迹起点。';
+function numField(id, value, step, max, unit, onset){
+  const wrap = document.createElement('span'); wrap.className = 'leg-f';
+  const inp = document.createElement('input');
+  inp.type = 'number'; inp.id = id; inp.step = step; inp.min = 0; inp.max = max;
+  inp.value = value; inp.setAttribute('aria-label', unit);
+  inp.onchange = () => {
+    const v = inp.valueAsNumber;
+    if (!Number.isFinite(v) || v < 0 || (step === 1 && !Number.isInteger(v))){ inp.value = value; return; }
+    value = v; onset(v); preview();
+  };
+  const u = document.createElement('span'); u.className = 'unit'; u.textContent = unit;
+  wrap.append(inp, u); return wrap;
+}
+function renderLegs(){
+  const box = $('legs'); box.textContent = '';
+  legs.forEach((leg, i) => {
+    const row = document.createElement('div'); row.className = 'leg';
+    const idx = document.createElement('span'); idx.className = 'leg-i'; idx.textContent = i + 1;
+    const kind = document.createElement('span'); kind.className = 'leg-k';
+    kind.textContent = leg.type === 'move' ? '移动' : '停留';
+    row.append(idx, kind);
+    if (leg.type === 'move'){
+      row.append(numField('leg-to-' + i, leg.to_m, 'any', sourceM || '', '距起点 m', v => { leg.to_m = v; }));
+      row.append(numField('leg-sp-' + i, leg.speed, 'any', '', 'm/s', v => { leg.speed = v; }));
+    } else {
+      row.append(numField('leg-sec-' + i, leg.seconds, 1, '', '秒', v => { leg.seconds = v; }));
+      row.append(numField('leg-jit-' + i, leg.jitter ?? 0, 'any', '', '抖动 σ m', v => { leg.jitter = v; }));
+    }
+    const del = document.createElement('button'); del.className = 'icon ghost'; del.textContent = '🗑';
+    del.setAttribute('aria-label', '删除第 ' + (i + 1) + ' 段');
+    del.onclick = () => { legs.splice(i, 1); renderLegs(); syncPreset(); preview(); };
+    row.append(del);
+    box.append(row);
+  });
+}
+function drawLegMarks(marks){
+  legMarkers.forEach(m => map.removeLayer(m)); legMarkers = [];
+  (marks || []).forEach((p, i) => legMarkers.push(
+    L.circleMarker(p, { radius:5, color:token('--bg-page'), weight:2, fillColor:token('--draw'), fillOpacity:1 })
+      .addTo(map).bindTooltip(String(i + 1))));
+}
+function setScriptOn(on){
+  scriptOn = on;
+  $('script-on').checked = on;
+  $('script-body').hidden = !on;
+  if (!on) setPicking(false);
+  renderLegs(); syncPreset();
+  return preview();
+}
 function updateEmpty(){ $('map-empty').hidden = hasTrack || drawing; }
 function resetTrack(){
-  hasTrack = false; totalPoints = 0; seen = 0;
+  hasTrack = false; libId = null; sourceM = 0; totalPoints = 0; seen = 0;
+  legs = []; setScriptOn(false);
   if (trackLine){ map.removeLayer(trackLine); trackLine = null; }
   if (startMarker){ map.removeLayer(startMarker); startMarker = null; }
+  drawLegMarks([]);
   $('summary').textContent = '尚未加载轨迹';
   $('upload-name').textContent = '上传轨迹文件';
   $('upload-meta').textContent = 'GPX / KML / GeoJSON · 或拖到此处';
@@ -1172,48 +1486,67 @@ function drawTrack(points){
   if (startMarker) map.removeLayer(startMarker);
   trackLine = L.polyline(points, { color:token('--accent'), weight:4, opacity:.9 }).addTo(map);
   startMarker = L.circleMarker(points[0], { radius:6, color:token('--bg-page'), weight:2, fillColor:token('--success'), fillOpacity:1 }).addTo(map);
-  map.fitBounds(trackLine.getBounds(), { padding:[40,40], maxZoom:17 });
+  if (fitPreview || !scriptOn) map.fitBounds(trackLine.getBounds(), { padding:[40,40], maxZoom:17 });
+  fitPreview = false;
 }
 let previewSeq = 0;
 async function preview(){
   if (!hasTrack) return;
   const seq = ++previewSeq;
-  const q = new URLSearchParams(params());
+  const p = params();
+  scriptReady = false;
+  syncButtons();
   $('map-loading').hidden = false;
   try {
-    const j = await api('/api/preview?' + q.toString());
+    const j = scriptOn ? await post('/api/preview', p.script ? p : {
+      include_source:true, speed:cfgDefaults.speed, from_gcj02:p.from_gcj02,
+    }) : await api('/api/preview?' + new URLSearchParams(p).toString());
     if (seq !== previewSeq) return;
     totalPoints = j.summary.n;
+    if (j.source_m !== undefined) sourceM = j.source_m;
+    scriptReady = !!p.script;
+    drawLegMarks(j.leg_marks);
+    $('script-total').textContent = '共 ' + (sourceM ? sourceM.toFixed(1) : '—') + ' m';
     $('summary').textContent = `${j.name} · ${j.summary.n} 点 · ${j.summary.km} km · ${j.summary.dur_s} s`;
-    drawTrack(j.points);
+    drawTrack(j.source_points || j.points);
     renderProgress(); renderChip();
   } catch(e){
     if (seq !== previewSeq) return;
     if (e.message === 'no track uploaded yet') resetTrack();
+    if (p.script){ drawLegMarks([]); $('summary').textContent = '请检查分段脚本。'; }
     handleError(e);
   }
-  finally { if (seq === previewSeq) $('map-loading').hidden = true; }
+  finally { if (seq === previewSeq){ $('map-loading').hidden = true; syncButtons(); } }
+}
+async function setSource(name, detail, id = null, script = []){
+  hasTrack = true; libId = id; sourceM = 0; fitPreview = true;
+  setPicking(false);
+  legs = script;
+  if (legs.length && $('script-bd').hidden) $('script-toggle').click();
+  $('upload-name').textContent = name;
+  $('upload-meta').textContent = detail;
+  clearCallout(); updateEmpty(); renderContext();
+  await setScriptOn(legs.length > 0);
+}
+async function changeSource(fn){
+  if (sourceBusy) return;
+  sourceBusy = true; syncButtons();
+  try { await fn(); }
+  catch(e){ handleError(e); }
+  finally { sourceBusy = false; syncButtons(); }
 }
 async function upload(){
   const f = $('file').files[0]; if (!f) return;
   const block = $('file-block');
   block.classList.add('loading');
   $('upload-meta').textContent = `正在上传 ${f.name}…`;
-  try {
+  await changeSource(async () => {
     const buf = await f.arrayBuffer();
     await api('/api/track?name=' + encodeURIComponent(f.name), { method:'POST', body:buf });
-    hasTrack = true;
-    $('upload-name').textContent = f.name;
-    $('upload-meta').textContent = `${fmtSize(buf.byteLength)} · 点击可替换`;
-    clearCallout(); updateEmpty(); renderContext();
-    await preview();
-  } catch(e){
-    $('upload-meta').textContent = '上传失败，点击重试。';
-    handleError(e);
-  } finally {
-    block.classList.remove('loading');
-    $('file').value = '';
-  }
+    await setSource(f.name, `${fmtSize(buf.byteLength)} · 点击可替换`);
+  });
+  block.classList.remove('loading');
+  $('file').value = '';
 }
 let dotState = '';
 function dotClass(){
@@ -1251,24 +1584,65 @@ function redrawDrawn(){
   if (drawing) updateDrawBadge();
 }
 function setDrawing(on){
+  if (on && picking) setPicking(false);
   drawing = on;
   $('draw').classList.toggle('primary', on);
   $('draw').setAttribute('aria-label', on ? '结束绘制' : '画轨迹');
   $('draw').title = on ? '结束绘制（Esc）' : '画轨迹';
-  $('map-wrap').classList.toggle('drawing', on);
+  $('map-wrap').classList.toggle('drawing', drawing || picking);
   $('draw-badge').hidden = !on;
   $('drawhint').textContent = on ? '绘制中：点击地图添加点，Esc 退出，Ctrl+Z 撤销。' : '在地图上点选路径点，至少 2 点。';
   $('map').setAttribute('aria-label', on ? '轨迹地图 · 绘制中：点击添加路径点，Esc 退出' : '轨迹地图');
   if (on) updateDrawBadge();
   updateEmpty();
 }
-map.on('click', e => { if (!drawing) return; drawnPts.push([e.latlng.lat, e.latlng.lng]); redrawDrawn(); });
+map.on('click', e => {
+  if (drawing){ drawnPts.push([e.latlng.lat, e.latlng.lng]); redrawDrawn(); return; }
+  if (picking) pickLeg(e.latlng);
+});
+function setPicking(on){
+  if (on && drawing) setDrawing(false);
+  pickSeq++; pickPending = false;
+  picking = on;
+  $('leg-pick').classList.toggle('primary', on);
+  $('leg-pick').textContent = on ? '退出选点' : '📍 地图选点';
+  $('leg-pick').setAttribute('aria-pressed', String(on));
+  $('map-wrap').classList.toggle('drawing', drawing || picking);
+  $('script-hint').textContent = on
+    ? '选点中：点击地图，自动吸附到轨迹并追加一段「移动到该点」。Esc 退出。'
+    : scriptHelp;
+}
+async function pickLeg(latlng){
+  if (pickPending || sourceBusy) return;
+  const seq = ++pickSeq;
+  pickPending = true;
+  try {
+    const j = await post('/api/script/project',
+      { lat: latlng.lat, lon: latlng.lng, from_gcj02: $('gcj').checked ? 1 : 0 });
+    if (seq !== pickSeq || sourceBusy) return;
+    sourceM = j.total_m;
+    if (j.at_m <= cursorM()){ toast('选点必须在上一段终点之后。', 'err'); return; }
+    appendMove(j.at_m);
+    toast(`已吸附到距起点 ${j.at_m.toFixed(1)} m。`);
+  } catch(e){ if (seq === pickSeq) handleError(e); }
+  finally { if (seq === pickSeq) pickPending = false; }
+}
+function appendMove(to){
+  const last = legs.findLast(leg => leg.type === 'move');
+  legs.push({ type:'move', to_m:to, speed:last ? last.speed : cfgDefaults.speed });
+  renderLegs(); preview();
+}
 function undoPoint(){ drawnPts.pop(); redrawDrawn(); }
 $('draw').onclick = () => setDrawing(!drawing);
 $('undo').onclick = undoPoint;
 $('dclear').onclick = () => { drawnPts = []; redrawDrawn(); };
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape'){ if (drawing) setDrawing(false); else closeDrawer(); return; }
+  if (e.key === 'Escape'){
+    if (drawing) setDrawing(false);
+    else if (picking) setPicking(false);
+    else closeDrawer();
+    return;
+  }
   const typing = e.target instanceof Element && e.target.closest('input,textarea,select');
   if ((e.ctrlKey || e.metaKey) && !e.altKey && !typing && e.key.toLowerCase() === 'z' && drawing){ e.preventDefault(); undoPoint(); }
   if (e.altKey && !e.ctrlKey && !e.metaKey){
@@ -1285,16 +1659,12 @@ async function restore(btn, fn){
   catch(e){ handleError(e); }
   finally { restoring = false; syncButtons(); renderChip(); }
 }
-$('duse').onclick = () => busy($('duse'), async () => {
-  try {
-    await post('/api/drawn', { points: drawnPts });
-    hasTrack = true; setDrawing(false); drawnPts = []; redrawDrawn();
-    $('upload-name').textContent = 'drawn track.gpx';
-    $('upload-meta').textContent = '地图手绘 · 点击可替换';
-    clearCallout(); updateEmpty(); renderContext();
-    await preview();
-  } catch(e){ handleError(e); }
-});
+$('duse').onclick = () => busy($('duse'), () => changeSource(async () => {
+  await post('/api/drawn', { points: drawnPts });
+  setDrawing(false); drawnPts = []; redrawDrawn();
+  $('gcj').checked = false;
+  await setSource('drawn track.gpx', '地图手绘 · 点击可替换');
+})).finally(() => { $('duse').disabled = drawnPts.length < 2; });
 $('pause').onclick = () => busy($('pause'), async () => {
   try { await post('/api/pause', { paused: curState !== 'paused' }); } catch(e){ handleError(e); }
 });
@@ -1303,7 +1673,8 @@ $('refresh').onclick = () => busy($('refresh'), refreshDevices);
 $('device').onchange = () => { showDevice(); renderContext(); };
 $('file').onchange = upload;
 $('preset').onchange = () => { syncPreset(); preview(); };
-['speed','scale','repeat','gcj'].forEach(id => $(id).onchange = preview);
+['speed','scale','repeat'].forEach(id => $(id).onchange = preview);
+$('gcj').onchange = () => { setPicking(false); sourceM = 0; fitPreview = true; preview(); };
 $('seg-speed').onclick = () => setMode('speed');
 $('seg-scale').onclick = () => setMode('scale');
 $('play').onclick = () => busy($('play'), async () => {
@@ -1316,6 +1687,91 @@ $('play').onclick = () => busy($('play'), async () => {
 });
 $('stop').onclick = () => restore($('stop'), () => api('/api/stop', { method:'POST' }));
 $('clear').onclick = () => restore($('clear'), () => post('/api/clear', { udid: $('device').value }));
+bindToggle('script-toggle', 'script-bd');
+$('script-on').onchange = () => setScriptOn($('script-on').checked);
+$('leg-move').onclick = () => {
+  const from = cursorM();
+  if (sourceM && from >= sourceM){ toast('已到轨迹终点，无法再加移动段。', 'err'); return; }
+  appendMove(Math.min(sourceM || from + 100, from + 100));
+};
+$('leg-end').onclick = () => appendMove(sourceM);
+$('leg-stay').onclick = () => {
+  legs.push({ type:'stay', seconds: 60, jitter: 1.0 });
+  renderLegs(); syncPreset(); preview();
+};
+$('leg-pick').onclick = () => {
+  if (!hasTrack){ toast('先上传或绘制一条轨迹。', 'err'); return; }
+  setPicking(!picking);
+  if (picking) $('map-wrap').scrollIntoView({ block:'nearest' });
+};
+async function loadLibrary(){
+  const seq = ++librarySeq;
+  try {
+    const { tracks } = await api('/api/tracks');
+    if (seq !== librarySeq) return;
+    const box = $('lib-list'); box.textContent = '';
+    if (libId && !tracks.some(t => t.id === libId)) libId = null;
+    syncButtons();
+    if (!tracks.length){
+      const empty = document.createElement('div'); empty.className = 'lib-empty';
+      empty.textContent = '保存上传或手绘的轨迹后，可以从这里重新加载。';
+      box.append(empty);
+    }
+    for (const t of tracks){
+      const row = document.createElement('div'); row.className = 'lib-row';
+      const open = document.createElement('button'); open.className = 'lib-load';
+      open.textContent = t.name;
+      open.title = `${t.name} · ${t.n} 点 · ${t.suffix}`;
+      open.onclick = () => busy(open, () => changeSource(async () => {
+        const j = await post('/api/tracks/load', { id:t.id });
+        $('gcj').checked = j.from_gcj02;
+        await setSource(j.name, '来自轨迹库 · 点击可替换', j.id, j.script);
+      }));
+      const meta = document.createElement('span'); meta.className = 'lib-meta';
+      meta.textContent = `${t.km} km${t.has_script ? ' · 脚本' : ''}${t.from_gcj02 ? ' · GCJ' : ''}`;
+      const del = document.createElement('button'); del.className = 'lib-delete ghost';
+      const disarm = () => {
+        delete del.dataset.armed;
+        del.textContent = '🗑'; del.setAttribute('aria-label', '删除 ' + t.name);
+      };
+      disarm();
+      let timer;
+      del.onclick = () => {
+        if (!del.dataset.armed){
+          del.dataset.armed = '1'; del.textContent = '确认';
+          del.setAttribute('aria-label', '确认删除 ' + t.name);
+          timer = setTimeout(disarm, 3000); return;
+        }
+        clearTimeout(timer); disarm();
+        return busy(del, async () => {
+          try {
+            await post('/api/tracks/delete', { id:t.id });
+            if (libId === t.id) libId = null;
+            syncButtons();
+            await loadLibrary();
+            toast('已删除 ' + t.name + '。');
+          } catch(e){ handleError(e); }
+        });
+      };
+      row.append(open, meta, del); box.append(row);
+    }
+  } catch(e){ if (seq === librarySeq) handleError(e); }
+}
+$('lib-refresh').onclick = () => busy($('lib-refresh'), loadLibrary);
+function saveLibrary(update){
+  const btn = $(update ? 'lib-update' : 'lib-save');
+  return busy(btn, () => changeSource(async () => {
+    const body = { from_gcj02:$('gcj').checked, script:scriptOn && legs.length ? legs : null };
+    if (update) body.id = libId;
+    else body.name = $('upload-name').textContent;
+    const j = await post(update ? '/api/tracks/update' : '/api/tracks/save', body);
+    libId = j.id;
+    await loadLibrary();
+    toast((update ? '已更新 ' : '已保存 ') + j.name + '。');
+  }));
+}
+$('lib-save').onclick = () => saveLibrary(false);
+$('lib-update').onclick = () => saveLibrary(true);
 $('empty-upload').onclick = () => $('file').click();
 $('empty-draw').onclick = () => { closeDrawer(); setDrawing(true); };
 $('udid-copy').onclick = async () => {
@@ -1434,7 +1890,8 @@ es.onmessage = ev => {
   if (m.type === 'log') log(m.line);
   else if (m.type === 'state') setStatus(m.state);
   else if (m.type === 'point'){
-    seen++; ensureMarker(m.lat, m.lon); renderProgress();
+    if (curState === 'playing' && seen < totalPoints) seen++;
+    ensureMarker(m.lat, m.lon); renderProgress();
     $('coord').textContent = `${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}`;
     renderChip();
   }
@@ -1464,7 +1921,8 @@ setMode('speed');
 updateEmpty();
 renderChip();
 syncButtons();
-refreshDevices(); loadConfig();
+setPicking(false);
+refreshDevices(); loadConfig(); loadLibrary();
 </script>
 </body>
 </html>

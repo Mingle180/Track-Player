@@ -27,6 +27,8 @@ DEFAULT_CONFIG = {
     # How often the last coordinate is re-asserted while holding position
     # (keep-alive against iOS fusion-location snap-back).
     "keepalive_interval_s": 1.0,
+    # Minimum seconds between two state.json flushes while playing.
+    "state_save_interval_s": 5.0,
 }
 
 

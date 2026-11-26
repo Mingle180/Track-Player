@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "track-player"
-version = "0.5.0"
+version = "0.6.0"
 description = "Simulate iPhone GPS along GPX/KML tracks on Windows for app testing (no Mac, no jailbreak, no app changes)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,4 +25,4 @@ trackplayer-gui = "trackplayer_gui:main"
 trackplayer-web = "trackplayer_web:main"
 
 [tool.setuptools]
-py-modules = ["trackplayer", "trackprep", "trackplayer_gui", "trackplayer_config", "trackplayer_web"]
+py-modules = ["trackplayer", "trackprep", "trackplayer_gui", "trackplayer_config", "trackplayer_web", "trackplayer_store"]

@@ -4,13 +4,17 @@
 import argparse
 import json
 import math
+import random
 import sys
 import xml.etree.ElementTree as ET
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BASE_TIME = datetime(2000, 1, 1, tzinfo=timezone.utc)
 EARTH_R = 6371000.0
+M_PER_DEG_LAT = 111320.0
+MAX_SCRIPT_POINTS = 1_000_000
 GCJ_A = 6378245.0
 GCJ_EE = 0.00669342162296594323
 
@@ -225,8 +229,8 @@ def write_gpx(path, points, name):
     ET.ElementTree(gpx).write(path, encoding='utf-8', xml_declaration=True)
 
 
-def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False):
-    """Parse a GPX/KML/GeoJSON file and return a 1 Hz-timestamped WGS-84 point list."""
+def parse_track(input_path, from_gcj02=False):
+    """Parse GPX/KML/GeoJSON into raw (lat, lon, time|None) WGS-84 vertices."""
     suffix = Path(input_path).suffix.lower()
     if suffix in ('.geojson', '.json'):
         try:
@@ -247,11 +251,176 @@ def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False):
                      f'(use .geojson/.json suffix for GeoJSON)')
     if len(points) < 2:
         sys.exit('error: need at least 2 track points')
-
     if from_gcj02:
         points = [(*gcj02_to_wgs84(lat, lon), t) for lat, lon, t in points]
+    return points
 
-    if speed is not None:
+
+def cumulative_lengths(points):
+    """Cumulative great-circle meters at each vertex (same length as points)."""
+    cum = [0.0]
+    for (lat1, lon1, _), (lat2, lon2, _) in zip(points, points[1:]):
+        cum.append(cum[-1] + haversine(lat1, lon1, lat2, lon2))
+    return cum
+
+
+def point_at(points, cum, dist):
+    """Interpolated (lat, lon) at cumulative distance dist, clamped to the track."""
+    if dist <= 0:
+        return points[0][:2]
+    if dist >= cum[-1]:
+        return points[-1][:2]
+    end = bisect_left(cum, dist, lo=1)
+    if dist == cum[end]:
+        return points[end][:2]
+    i = end - 1
+    seg = cum[i + 1] - cum[i]
+    frac = (dist - cum[i]) / seg if seg > 0 else 0.0
+    lat1, lon1, _ = points[i]
+    lat2, lon2, _ = points[i + 1]
+    return lat1 + (lat2 - lat1) * frac, lon1 + (lon2 - lon1) * frac
+
+
+def slice_track(points, cum, start_m, end_m):
+    """Sub-polyline between two cumulative distances, endpoints interpolated."""
+    lat1, lon1 = point_at(points, cum, start_m)
+    lat2, lon2 = point_at(points, cum, end_m)
+    out = [(lat1, lon1, None)]
+    out.extend((lat, lon, None) for lat, lon, _ in
+               points[bisect_right(cum, start_m):bisect_left(cum, end_m)])
+    out.append((lat2, lon2, None))
+    return out
+
+
+def project_point(points, cum, lat, lon):
+    """Snap (lat, lon) onto the polyline; return (along_m, snap_lat, snap_lon).
+
+    Uses a local tangent plane anchored at the query point: exact enough for
+    track-scale geometry and far cheaper than per-segment haversine iteration.
+    """
+    coslat = math.cos(math.radians(lat))
+    best_d2 = float('inf')
+    best = (0.0, points[0][0], points[0][1])
+    for i in range(len(points) - 1):
+        lat1, lon1, _ = points[i]
+        lat2, lon2, _ = points[i + 1]
+        ax = (lon1 - lon) * coslat * M_PER_DEG_LAT
+        ay = (lat1 - lat) * M_PER_DEG_LAT
+        bx = (lon2 - lon) * coslat * M_PER_DEG_LAT
+        by = (lat2 - lat) * M_PER_DEG_LAT
+        dx, dy = bx - ax, by - ay
+        ll = dx * dx + dy * dy
+        t = 0.0 if ll == 0 else min(1.0, max(0.0, -(ax * dx + ay * dy) / ll))
+        px, py = ax + dx * t, ay + dy * t
+        d2 = px * px + py * py
+        if d2 < best_d2:
+            best_d2 = d2
+            best = (cum[i] + t * (cum[i + 1] - cum[i]),
+                    lat1 + (lat2 - lat1) * t, lon1 + (lon2 - lon1) * t)
+    return best
+
+
+def _script_number(value, n, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'error: leg {n} {field} must be a finite number')
+    try:
+        value = float(value)
+    except OverflowError:
+        value = math.inf
+    if not math.isfinite(value):
+        raise ValueError(f'error: leg {n} {field} must be a finite number')
+    return value
+
+
+def _script_plan(points, script, repeat_n):
+    if not isinstance(script, list) or not script:
+        raise ValueError('error: script must be a non-empty list of legs')
+    cum = cumulative_lengths(points)
+    total = cum[-1]
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError('error: track has zero length')
+    remaining = MAX_SCRIPT_POINTS // max(1, repeat_n) - 1
+    cursor = 0.0
+    steps = []
+    for n, leg in enumerate(script, 1):
+        if not isinstance(leg, dict):
+            raise ValueError(f'error: leg {n} must be an object')
+        kind = leg.get('type')
+        if kind == 'move':
+            to_m = _script_number(leg.get('to_m'), n, 'to_m')
+            speed = _script_number(leg.get('speed'), n, 'speed')
+            if speed <= 0:
+                raise ValueError(f'error: leg {n} speed must be > 0')
+            if not cursor < to_m <= total:
+                raise ValueError(f'error: leg {n} to_m must be > {cursor:.1f} and <= {total:.1f}')
+            seconds = (to_m - cursor) / speed
+            if seconds > remaining:
+                raise ValueError(f'error: leg {n} exceeds the {MAX_SCRIPT_POINTS:,}-point script limit')
+            # Keep each full-speed step and reserve one tick for any remainder.
+            whole = round(seconds)
+            ticks = max(1, whole if abs(seconds - whole) < 1e-9 else math.ceil(seconds))
+            steps.append((kind, ticks, cursor, to_m, speed))
+            cursor = to_m
+        elif kind == 'stay':
+            ticks = leg.get('seconds')
+            seed = leg.get('seed', 0)
+            if type(ticks) is not int or ticks < 1:
+                raise ValueError(f'error: leg {n} seconds must be an integer >= 1')
+            if type(seed) is not int:
+                raise ValueError(f'error: leg {n} seed must be an integer')
+            jitter = _script_number(leg.get('jitter', 0.0), n, 'jitter')
+            if jitter < 0:
+                raise ValueError(f'error: leg {n} jitter must be >= 0')
+            steps.append((kind, ticks, cursor, jitter, seed + n))
+        else:
+            raise ValueError(f'error: leg {n} type must be "move" or "stay"')
+        remaining -= ticks
+        if remaining < 0:
+            raise ValueError(f'error: leg {n} exceeds the {MAX_SCRIPT_POINTS:,}-point script limit')
+    return cum, steps
+
+
+def validate_script(points, script, repeat_n=1):
+    """Validate a script against the source geometry without allocating its points."""
+    _script_plan(points, script, repeat_n)
+
+
+def compile_script(points, script, repeat_n=1):
+    """Compile a movement script into a strictly 1 Hz WGS-84 point list."""
+    cum, steps = _script_plan(points, script, repeat_n)
+    out = [(*points[0][:2], BASE_TIME)]
+    for kind, ticks, cursor, target, value in steps:
+        if kind == 'move':
+            for tick in range(1, ticks + 1):
+                dist = target if tick == ticks else cursor + tick * value
+                out.append((*point_at(points, cum, dist), BASE_TIME + timedelta(seconds=len(out))))
+        else:
+            jitter, seed = target, value
+            rng = random.Random(seed)
+            alat, alon = point_at(points, cum, cursor)
+            meters_per_lon = M_PER_DEG_LAT * math.cos(math.radians(alat))
+            for _ in range(ticks):
+                lat, lon = alat, alon
+                if jitter:
+                    lat += rng.gauss(0, jitter) / M_PER_DEG_LAT
+                    lon += rng.gauss(0, jitter) / meters_per_lon
+                    if not -90 <= lat <= 90 or not math.isfinite(lon):
+                        raise ValueError('error: stay jitter produces invalid coordinates')
+                    if not -180 <= lon <= 180:
+                        lon = (lon + 180) % 360 - 180
+                out.append((lat, lon, BASE_TIME + timedelta(seconds=len(out))))
+    return out
+
+
+def prepare(input_path, speed=None, scale=None, repeat_n=1, from_gcj02=False, script=None):
+    """Parse a GPX/KML/GeoJSON file and return a 1 Hz-timestamped WGS-84 point list."""
+    points = parse_track(input_path, from_gcj02)
+
+    if script is not None:
+        if speed is not None or scale is not None:
+            raise ValueError('error: --script cannot be combined with --speed/--scale')
+        points = compile_script(points, script, repeat_n)
+    elif speed is not None:
         points = resample(points, speed)
     elif scale is not None:
         if any(t is None for _, _, t in points):

@@ -1,0 +1,6 @@
+[
+  {"type": "move", "to_m": 100.0, "speed": 3.0},
+  {"type": "stay", "seconds": 60, "jitter": 1.0, "seed": 7},
+  {"type": "move", "to_m": 350.0, "speed": 5.5},
+  {"type": "stay", "seconds": 120, "jitter": 0.0}
+]

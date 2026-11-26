@@ -108,6 +108,30 @@ python -m trackplayer_web
 - 地图底图用高德栅格瓦片、Leaflet 从 CDN 加载，**首次打开需联网**；仅供开发者本地测试使用。
 - 与 GUI/CLI 共用 `play_track` 核心，同一时刻只跑一个播放会话（单隧道）。
 
+#### 分段速度与停留点
+
+上传或绘制轨迹后，展开「分段速度与停留点」，开启脚本并添加移动段或停留点。可直接填累计里程，也可用「地图选点」吸附到源轨迹，或用「移动到终点」补齐剩余路段。设定脚本后，播放使用各段速度。脚本最后一段决定本次播放的终点。
+
+脚本采用 JSON 数组格式：
+
+```json
+[
+  {"type": "move", "to_m": 100, "speed": 3},
+  {"type": "stay", "seconds": 60, "jitter": 1, "seed": 7},
+  {"type": "move", "to_m": 350, "speed": 5.5}
+]
+```
+
+- `to_m` 是从源轨迹起点算起的累计米数，各移动段须严格递增且不超过总长。`speed` 单位为 m/s。每秒采样一次，最后不足一秒的路程也占一个采样间隔，确保落在段终点。
+- `stay` 在当前位置停留 `seconds` 整秒，开头的停留发生在起点。`jitter` 是高斯抖动的标准差，单位为米，默认为 0。指定 `seed` 可复现抖动。
+- 从仓库根目录运行 `trackplayer play examples/pku54_loop.gpx --script examples/legs_demo.json`，可用示例脚本体验分段播放。`--script` 与 `--speed`、`--scale`、`--preset` 互斥。
+
+#### 轨迹库与上次位置
+
+- 「轨迹库」可保存上传或手绘的原始轨迹，连同坐标系设置和启用的脚本一起保存。加载条目可继续编辑，点「更新库中条目」写回脚本和坐标系。删除需要在 3 秒内再点一次确认。
+- 轨迹库存放在 `~/.trackplayer/tracks/`。Web 服务把最后注入的位置保存到 `~/.trackplayer/state.json`，播放时默认每 5 秒写一次，停止或正常退出时再写一次。服务重启后地图回到最后落盘的位置。强制结束进程时，位置可能落后数秒。点「恢复定位」会清除该记录。
+- 可在 `~/.trackplayer/config.json` 中设置 `state_save_interval_s`，重启 Web 服务后生效。
+
 ### 方式二：图形界面（窗口操作）
 
 ```bash
@@ -139,7 +163,7 @@ trackplayer devices                                 # 列出已连接设备（�
 trackplayer clear                                   # 立即恢复真实定位
 ```
 
-`play` 选项：`--speed`/`--scale`/`--preset`（三选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。输入支持 `.gpx`/`.kml`/`.geojson`/`.json`。多设备时必须用 `--udid` 指定。交互模式下**回车停止**、**`p`+回车 暂停/继续**（暂停冻结坐标并保持通道，`--duration` 时钟同步冻结）。
+`play` 选项：`--speed`/`--scale`/`--preset`/`--script`（四选一）、`--repeat N`、`--from-gcj02`、`--duration 秒`、`--udid <UDID>`、`-o out.gpx`（保留预处理结果）。输入支持 `.gpx`/`.kml`/`.geojson`/`.json`。多设备时必须用 `--udid` 指定。交互模式下**回车停止**、**`p`+回车 暂停/继续**（暂停冻结坐标并保持通道，`--duration` 时钟同步冻结）。
 
 ### 方式四：trackprep + 官方命令（手动）
 

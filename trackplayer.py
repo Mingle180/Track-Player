@@ -219,7 +219,7 @@ async def _play_async(points, udid, duration, stop_event, on_log, keepalive, on_
 
 
 def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False,
-               udid=None, duration=None, output=None,
+               udid=None, duration=None, output=None, script=None,
                stop_event=None, on_log=None, notice=None, on_point=None, pause_event=None):
     """Prepare a track, play it on the device, and restore real location on exit.
 
@@ -236,6 +236,8 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
       for the "press ENTER / Ctrl+C" hint).
     - on_point(lat, lon): called with each injected WGS-84 coordinate (feeding,
       pause hold and keep-alive hold), for live map previews. Defaults to a no-op.
+    - script: optional movement-script leg list (per-leg speeds + stay points);
+      compiled by trackprep and mutually exclusive with speed/scale.
     Validation failures raise ValueError; device/prep failures raise RuntimeError
     (so the GUI can catch and show a dialog instead of exiting).
     On return, real location has been restored.
@@ -253,7 +255,7 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
 
     udid = pick_device(udid)
     try:
-        points = trackprep.prepare(input_path, speed, scale, repeat, from_gcj02)
+        points = trackprep.prepare(input_path, speed, scale, repeat, from_gcj02, script)
     except SystemExit as e:
         raise RuntimeError(str(e)) from None
 
@@ -285,6 +287,15 @@ def play_track(input_path, *, speed=None, scale=None, repeat=1, from_gcj02=False
 
 def cmd_play(args):
     speed = args.speed
+    script = None
+    if args.script:
+        try:
+            with open(args.script, encoding='utf-8') as f:
+                script = json.load(f)
+        except (OSError, ValueError) as e:
+            sys.exit(f'error: cannot read script {args.script}: {e}')
+        if not isinstance(script, list) or not script:
+            sys.exit('error: script must be a non-empty list of legs')
     if args.preset:
         preset = config.find_preset(args.preset)
         if preset is None:
@@ -327,8 +338,8 @@ def cmd_play(args):
     try:
         play_track(args.input, speed=speed, scale=args.scale, repeat=args.repeat,
                    from_gcj02=args.from_gcj02, udid=args.udid, duration=args.duration,
-                   output=args.output, stop_event=stop_event, on_log=print, notice=notice,
-                   pause_event=pause_event)
+                   output=args.output, script=script, stop_event=stop_event, on_log=print,
+                   notice=notice, pause_event=pause_event)
     except (ValueError, RuntimeError) as e:
         sys.exit(str(e))
 
@@ -376,6 +387,7 @@ def main():
                '  trackplayer play route.gpx --preset 跑步\n'
                '  trackplayer play amap.gpx --from-gcj02 --speed 3\n'
                '  trackplayer play loop.gpx --speed 5 --duration 60\n'
+               '  trackplayer play loop.gpx --script examples/legs_demo.json\n'
                '  trackplayer devices\n'
                '  trackplayer clear\n'
                '  trackplayer gui\n'
@@ -391,6 +403,7 @@ def main():
     g.add_argument('--speed', type=float, metavar='MPS', help='constant speed in m/s, resampled to 1 Hz (e.g. 3 = running)')
     g.add_argument('--scale', type=float, metavar='X', help='speed multiplier vs recorded timestamps (e.g. 2 = twice as fast)')
     g.add_argument('--preset', metavar='NAME', help='speed preset from config (e.g. 步行/跑步/骑行/驾车); sets speed in m/s')
+    g.add_argument('--script', metavar='FILE', help='JSON movement script (per-leg speeds + stay points); see examples/legs_demo.json')
     p.add_argument('--repeat', type=int, default=1, metavar='N', help='repeat the track N times (default 1)')
     p.add_argument('--from-gcj02', action='store_true', help='input is GCJ-02 (AMap/Tencent); convert to WGS-84')
     p.add_argument('--udid', help='target device UDID (required only when multiple devices are connected)')
